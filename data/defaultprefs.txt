@@ -1,0 +1,109 @@
+# Example configuration
+# Programmable input pins:
+# Station-list buttons use commands: ok, up, down, left, right
+# IR numeric buttons use preset=0 ... preset=9 and are combined before switching
+gpio_00 = uppreset = 1
+gpio_25 = upvolume = 2
+gpio_33 = downvolume = 2
+gpio_16 = stop
+gpio_17 = resume
+gpio_21 = station = icecast.omroep.nl:80/radio1-bb-mp3
+#
+# Battery monitor
+batt100 = 2950
+batt0 = 2600 
+# MQTT settings
+mqttbroker = none
+mqttport = 1883
+mqttuser = none
+mqttpasswd = none
+mqttprefix = none
+# Enter your WiFi network specs here:
+wifi_00 = Upper/*******
+wifi_01 = Lower/*******
+#
+volume = 72
+toneha = 0
+tonehf = 0
+tonela = 0
+tonelf = 0
+#
+preset = 13
+preset_00 = stream.rusyn.fm/rusyny.mp3               # 00 rusyn FM
+preset_01 = icecast.stv.livebox.sk/slovensko_128.mp3 # 01 Slovensko
+preset_02 = icecast.stv.livebox.sk/devin_128.mp3     # 02 Devín
+preset_03 = icecast.stv.livebox.sk/litera_128.mp3    # 03 Litera
+preset_04 = 109.71.67.102:8000/beta_live_high.mp3    # 04 Radio beta
+preset_05 = 109.71.67.102:8000/beta_cspop.mp3        #.05 CS pop
+preset_06 = s3.voscast.com:10038/                    # 06 Default stream
+preset_07 = vh11367x.out.airtime.pro:8000/vh11367x_a # 07 Midnight Cafe Radio
+preset_08 = online.radiorelax.ua/RadioRelax          # 08 Relax
+preset_09 = online.radiorelax.ua/RadioRelax_Int      # 09 RadioRelax Int
+preset_10 = online.radiorelax.ua/RadioRelax_Instrumental # 10 RadioRelax Instrumental
+preset_11 = online.radiorelax.ua/RadioRelax_Cafe     # 11 RadioRelax Cafe
+preset_12 = s3.voscast.com:10038/;                   # 12 101 SMOOTH JAZZ MELLOW MIX
+preset_13 = instrumental-orchestral-hits.stream.laut.fm/instrumental-orchestral-hits # 13 Instrumental & Orchestral Hits
+preset_14 = emiteradio.com/proxy/instrumental?mp=/stream # 14 Radio Instrumental U
+preset_15 = streams.abidingradio.com:7800/1          # 15 Abiding Radio
+preset_16 = quincy.torontocast.com:1915/stream       # 16 Stream
+preset_17 = ais-sa2.cdnstream1.com/2209_128.mp3      # 17 Radio Lounge
+preset_18 = air-tunein.radioart.com/fSolo_piano.mp3  # 18 Radio Art - Piano
+preset_19 = air-tunein.radioart.com/fPiano_and_guitar.mp3 # 19 Radio Art - Piano & Guitar
+preset_20 = stream.instrumentalhits.de:8060          # 20 Instrumental hits
+preset_21 = instrumental.stream.laut.fm/instrumental # 21 Instrumental
+preset_22 = allzic53.ice.infomaniak.ch/allzic53.mp3  # 22 Allzic Radio Chill Out
+preset_23 = streaming.radioempresabrasil.com.br/proxy/novainstrumental/stream   # 23 Rádio Nova Instrumental
+preset_24 = total-instrumental.stream.laut.fm/total-instrumental # 24 Total instrumental
+preset_25 = jzr-saxo.ice.infomaniak.ch/jzr-saxo.mp3  # 25 Jazz Radio - Saxo
+preset_26 = 109.206.96.34:8100                       # 26 NAXI LOVE RADIO, Belgrade, Serbia
+preset_27 = ais-sa2.cdnstream1.com/2210_128.mp3      # 27 1000 HITS Love
+preset_28 = instrumental-orchestral-hits.stream.laut.fm/instrumental-orchestral-hits # 28 Instrumental Orchestral Hits
+preset_29 = ais-sa2.cdnstream1.com/2459_128.mp3?     # 29 Lovely Instrumentals 101.5 FM
+preset_60 = icecast-newradio.cdnvideo.ru/newradio3   # 60 Новое Радио
+preset_61 = listen2.myradio24.com/4156               # 61 РАДИО СТРАНСТВИЙ
+preset_62 = 188.40.62.20:8070                        # 62 Nes radio Banja Luka
+#
+# Clock offset and daylight saving time
+clk_server = pool.ntp.org                            # Time server to be used
+clk_offset = 1                                       # Offset with respect to UTC in hours
+clk_dst = 1                                          # Offset during daylight saving time (hours)
+#
+# 21-key IR remote: OK opens/confirms station list; number keys enter a preset number
+# In station list: C23D/22DD move one row, 629D/A857 move one page
+ir_02FD = ok
+ir_6897 = preset = 0
+ir_30CF = preset = 1
+ir_18E7 = preset = 2
+ir_7A85 = preset = 3
+ir_10EF = preset = 4
+ir_38C7 = preset = 5
+ir_5AA5 = preset = 6
+ir_42BD = preset = 7
+ir_4AB5 = preset = 8
+ir_52AD = preset = 9
+ir_22DD = downpreset = 1
+ir_629D = upvolume = 2
+ir_A857 = downvolume = 2
+ir_C23D = uppreset = 1
+#
+# GPIO pinnings
+pin_ir = 35                                          # GPIO Pin number for IR receiver VS1838B
+pin_enc_clk = 12                                     # GPIO Pin number for rotary encoder "CLK"
+pin_enc_dt = 14                                      # GPIO Pin number for rotary encoder "DT"
+pin_enc_sw = 13                                      # GPIO Pin number for rotary encoder "SW"
+#
+pin_tft_cs = 15                                       # GPIO Pin number for TFT "CS"
+pin_tft_dc = 2                                       # GPIO Pin number for TFT "DC"
+#
+# define pins for decoder.  Example for VS1053
+pin_vs_cs = 5                                        # GPIO Pin number for VS1053 "CS"
+pin_vs_dcs = 32                                      # GPIO Pin number for VS1053 "DCS"
+pin_vs_dreq = 4                                     # GPIO Pin number for VS1053 "DREQ"
+#
+# define pins for decoder.  Example for I2S, like PCM5102
+#pin_i2s_bck = 15                                    # GPIO Pin number for I2S "BCK"
+#pin_i2s_lck = 27                                    # GPIO Pin number for I2S "L(R)CK"
+#pin_i2s_din = 26                                    # GPIO Pin number for I2S "DIN"
+#
+# define pins for decoder.  Example for Toslink
+#pin_i2s_spdif = 15                                  # GPIO Pin number for I2S/SPDIF
