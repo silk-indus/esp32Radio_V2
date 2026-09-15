@@ -54,6 +54,9 @@ struct mp3spec_t                                      // For List of mp3 file on
   bool            SD_playing = false ;                  // Local track playback is active
   bool            SD_cover_visible = false ;            // Cover currently occupies the TFT
   bool            randomplay = false ;                  // Switch for random play
+  volatile bool   SD_mount_requested = false ;          // User requested one explicit media check
+  volatile bool   SD_media_check_complete = false ;     // Main task may open the MP3 browser
+  volatile bool   SD_open_menu_requested = false ;      // Open browser after the check/scan
   File            trackfile ;                           // File for tracknames
   bool            trackfile_isopen = false ;            // True if trackfile is open for read
   
@@ -814,10 +817,11 @@ struct mp3spec_t                                      // For List of mp3 file on
   void SDCardRemoved()
   {
     ESP_LOGI ( STAG, "SD card removed" ) ;
+    bool wasPlaying = SD_playing ;                       // Do not stop an unrelated radio stream
     mp3filelength = 0 ;                                  // Stop reads from the vanished file
     closeTrackfile() ;                                   // Do not retain an invalid file handle
     close_SDCARD() ;
-    if ( dataqueue ) queueToPt ( QSTOPSONG ) ;           // Flush pending audio from the old card
+    if ( wasPlaying && dataqueue ) queueToPt ( QSTOPSONG ) ; // Flush only old SD audio
     if ( SD_mounted ) SD.end() ;                         // Release filesystem and SPI chip select
     SD_okay = false ;
     SD_mounted = false ;
@@ -832,7 +836,7 @@ struct mp3spec_t                                      // For List of mp3 file on
   //**************************************************************************************************
   // Check if new SD card is inserted and can be read.                                               *
   //**************************************************************************************************
-  bool SDInsertCheck()
+  bool SDInsertCheck ( bool forceMount = false )
   {
     static uint32_t nextCheckTime = 0 ;                     // To prevent checking too often
     uint32_t        newmillis ;                             // Current timestamp
@@ -841,10 +845,11 @@ struct mp3spec_t                                      // For List of mp3 file on
     static uint8_t  probeFailures = 0 ;                     // Ignore one incidental read failure
     int8_t          dpin = ini_block.sd_detect_pin ;        // SD inserted detect pin
 
-    if ( ( newmillis = millis() ) < nextCheckTime )         // Time to check?
+    if ( !forceMount && ( newmillis = millis() ) < nextCheckTime ) // Time to check?
     {
       return false ;                                        // No, return "no new insert"
     }
+    if ( forceMount ) newmillis = millis() ;
     nextCheckTime = newmillis + 5000 ;                      // Yes, set new check time
     if ( dpin >= 0 )                                        // Hardware detection possible?
     {
@@ -872,6 +877,10 @@ struct mp3spec_t                                      // For List of mp3 file on
     {
       if ( SD_mounted && SD_okay )                          // Card was available last time?
       {
+        if ( !forceMount && !SD_playing )                   // Radio/idle mode must not touch SPI
+        {
+          return false ;                                    // Check again only on explicit MP3-menu request
+        }
         File probe = SD.open ( TRACKLIST, FILE_READ ) ;     // One lightweight physical access
         bool probeOkay = probe &&                          // Force one real data read if non-empty
                            ( probe.size() == 0 || probe.read() >= 0 ) ;
@@ -881,15 +890,16 @@ struct mp3spec_t                                      // For List of mp3 file on
           probeFailures = 0 ;                              // Healthy: no folder scan is performed
           return false ;                                   // Not a newly inserted card
         }
-        if ( ++probeFailures < 2 )                         // Avoid reacting to a transient SPI error
+        if ( !forceMount && ++probeFailures < 2 )          // Avoid a transient error while SD plays
         {
           ESP_LOGW ( STAG, "SD presence check failed, will retry" ) ;
           return false ;
         }
         probeFailures = 0 ;
-        SDCardRemoved() ;                                  // Next interval will attempt a new mount
-        return false ;
+        SDCardRemoved() ;                                  // Release stale filesystem state
+        if ( !forceMount ) return false ;                  // Never auto-mount after removal
       }
+      if ( !forceMount ) return false ;                    // No repeated SD.begin() without detect pin
       ESP_LOGI ( STAG, "Try to mount SD card" ) ;
       SD_okay = mount_SDCARD ( ini_block.sd_cs_pin ) ;      // Try to mount
       if ( SD_okay )
@@ -931,18 +941,27 @@ struct mp3spec_t                                      // For List of mp3 file on
   //                                       S D T A S K                                               *
   //**************************************************************************************************
   // This task will constantly try to fill the ringbuffer with filenames on SD.                      *
-  // Card presence is checked every 5 seconds.  Without a detect pin this is only one lightweight    *
-  // access to tracklist.dat; folders are scanned only after a successful new mount.                 *
+  // With no detect pin, mount once at boot and thereafter only when the MP3 menu requests it.        *
+  // While an SD track plays, a lightweight presence check can still stop it after removal.          *
   //**************************************************************************************************
   void SDtask ( void * parameter )
   {
     const char* ffn ;                                     // First filename on SD card
+    bool firstCheck = true ;                              // One automatic mount attempt at boot
 
     vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;            // Start delay
     while ( true )                                        // Endless task
     {
       vTaskDelay ( 200 / portTICK_PERIOD_MS ) ;           // Allow other tasks
-      if ( SDInsertCheck() )                              // See if new card is inserted
+      bool userCheck = SD_mount_requested ;
+      if ( userCheck )
+      {
+        SD_mount_requested = false ;                      // Consume exactly one explicit request
+        SD_media_check_complete = false ;
+      }
+      bool newCard = SDInsertCheck ( firstCheck || userCheck ) ;
+      firstCheck = false ;
+      if ( newCard )                                      // See if new card is inserted
       {
         SD_lastmp3spec[0] = '\0' ;                        // No last track
         SD_filecount = 0 ;
@@ -973,6 +992,7 @@ struct mp3spec_t                                      // For List of mp3 file on
                      ffn ) ;
         }
       }
+      if ( userCheck ) SD_media_check_complete = true ;   // Scanning, if needed, is now finished
     }
   }
 #endif

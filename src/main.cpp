@@ -117,7 +117,7 @@
 
 //
 // Define the version number, the format used is the HTTP standard.
-#define VERSION     "Tue, 15 Sep 2026 21:00:00 GMT"
+#define VERSION     "Tue, 15 Sep 2026 22:00:00 GMT"
 //
 #include <Arduino.h>                                      // Standard include for Platformio Arduino projects
 #include "soc/soc.h"                                      // For brown-out detector setting
@@ -225,7 +225,7 @@ bool        readhostfrompref ( int16_t preset, String* host, String* hsym = NULL
 void        enterStationDigit ( uint8_t digit ) ;
 void        confirmStationNumber() ;
 void        openStationList() ;
-void        openSDList() ;
+void        openSDList ( bool mediaChecked = false ) ;
 void        moveStationList ( int8_t direction, uint8_t count ) ;
 void        confirmStationList() ;
 
@@ -2573,11 +2573,19 @@ void openStationList()
   drawStationList() ;
 }
 
-void openSDList()
+void openSDList ( bool mediaChecked )
 {
   #ifdef SDCARD
     if ( !dsp_ok ) return ;
     SD_cover_visible = false ;                         // Any menu exits full-screen cover mode
+    if ( ini_block.sd_detect_pin < 0 && !mediaChecked )
+    {
+      SD_open_menu_requested = true ;                  // Check stale/remounted media asynchronously
+      SD_media_check_complete = false ;
+      SD_mount_requested = true ;                      // Exactly one SD access requested by the user
+      ESP_LOGI ( TAG, "MP3 menu requested: check SD card once" ) ;
+      return ;
+    }
     if ( !SD_okay || SD_filecount <= 0 || !sdqueue )
     {
       ESP_LOGI ( TAG, "SD track list is not ready or is empty" ) ;
@@ -3687,7 +3695,7 @@ void setup()
   ESP_LOGI ( TAG, "Version %s.  Free memory %d",
              VERSION,
              heapspace ) ;                                // Normally about 100 kB
-  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V34-20260915" ) ; // UTF-16/Latin-1/UTF-8 ID3 text
+  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V35-20260915" ) ; // On-demand SD remount without radio disruption
   ESP_LOGI ( TAG, "Display type is %s", DISPLAYTYPE ) ;   // Report display option
   
   if ( !SPIFFS.begin ( FSIF ) )                           // Mount and test SPIFFS
@@ -4837,6 +4845,15 @@ void loop()
   handleSaveReq() ;                                 // See if time to save settings
   handleIpPub() ;                                   // See if time to publish IP
   handleVolPub() ;                                  // See if time to publish volume
+  #ifdef SDCARD
+    if ( SD_open_menu_requested && SD_media_check_complete )
+    {
+      SD_open_menu_requested = false ;              // Explicit check finished, successful or not
+      SD_media_check_complete = false ;
+      if ( SD_okay && SD_filecount > 0 ) openSDList ( true ) ;
+      else ESP_LOGI ( TAG, "MP3 menu not opened: SD card is absent or empty" ) ;
+    }
+  #endif
   chk_enc() ;                                       // Check rotary encoder functions
   pump_secure_stream() ;                            // Feed HTTPS data into the common stream parser
   radiofuncs() ;                                    // Handle start/stop commands for icecast
