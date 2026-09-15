@@ -6,7 +6,7 @@
   #define path() name()                               // Use "name()" instead
 #endif
 #define MAXFNLEN    255                               // Max length of a full filespec
-#define SD_MAXDEPTH 4                                 // Maximum depths.  Note: see mp3play_html.
+#define SD_MAXDEPTH 8                                 // Maximum MP3 folder nesting depth
 
 struct mp3spec_t                                      // For List of mp3 file on SD card
 {
@@ -32,6 +32,7 @@ struct mp3spec_t                                      // For List of mp3 file on
   #include <SPI.h>
   #include <SD.h>
   #include <FS.h>
+  #include <strings.h>                                  // strcasecmp for .mp3/.MP3 variants
   #define SDSPEED   2000000                             // SPI speed of SD card
   #define TRACKLIST "/tracklist.dat"                    // File with tracklist on SD card
 
@@ -100,6 +101,12 @@ struct mp3spec_t                                      // For List of mp3 file on
     if ( ! openTrackfile() )                            // Try to open track file
     {
       return NULL ;                                     // File not available
+    }
+    if ( trackfile.available() < 3 )                    // No complete entry available?
+    {
+      closeTrackfile() ;
+      SD_filecount = 0 ;
+      return NULL ;
     }
     uint8_t* p = (uint8_t*)&mp3entry ;                  // Point to entrylength of mp3entry
     trackfile.read ( p, sizeof(mp3entry.entrylen) ) ;   // Get total size of entry
@@ -296,15 +303,17 @@ struct mp3spec_t                                      // For List of mp3 file on
     file = root.openNextFile() ;
     while ( file )
     {
-      vTaskDelay ( 50 / portTICK_PERIOD_MS ) ;            // Allow others
+      vTaskDelay ( 1 ) ;                                  // Yield without slowing large folder scans
       if ( file.isDirectory() )                           // Is it a directory?
       {
-        //ESP_LOGI ( STAG, "  DIR : %s", file.path() ) ;
+        String childPath = String ( file.path() ) ;        // Keep path after closing child handle
+        file.close() ;                                     // Limit simultaneous handles while recursing
         if ( levels )                                     // Dig in subdirectory?
         {
-          if ( strrchr ( file.path(), '/' )[1] != '.' )   // Skip hidden directories
+          const char* basename = strrchr ( childPath.c_str(), '/' ) ;
+          if ( basename && basename[1] != '.' )            // Skip hidden directories
           {
-            if ( ! getsdtracks ( file.path(),             // Non hidden directory: call recursive
+            if ( ! getsdtracks ( childPath.c_str(),       // Non hidden directory: call recursive
                                   levels -1 ) )
             {
               return false ;                              // File I/O error
@@ -315,15 +324,17 @@ struct mp3spec_t                                      // For List of mp3 file on
       else                                                // It is a file
       {
         const char* ext = file.name() ;                   // Point to begin of name
-        ext = ext + strlen ( ext ) - 4 ;                  // Point to extension
-        if ( ( strcmp ( ext, ".MP3" ) == 0 ) ||           // It is a file, but is it an MP3?
-            ( strcmp ( ext, ".mp3" ) == 0 ) )
+        size_t namelen = strlen ( ext ) ;
+        ext = namelen >= 4 ? ext + namelen - 4 : ext ;    // Point safely to extension
+        if ( namelen >= 4 && strcasecmp ( ext, ".mp3" ) == 0 )
         {
           if ( ! addToFileList ( file.path() ) )          // Add file to the list
           {
+            file.close() ;
             break ;                                       // No need to continue
           }
         }
+        file.close() ;                                     // Release before opening the next entry
       }
       file = root.openNextFile() ;
     }
@@ -679,7 +690,7 @@ struct mp3spec_t                                      // For List of mp3 file on
     if ( csPin >= 0 )                                      // SD configured?
     {
       SD_mounted = SD.begin ( csPin, SPI,                  // Yes, try to init SD card driver
-                              SDSPEED, "/sd", 3 ) ;
+                              SDSPEED, "/sd", 12 ) ;       // Enough handles for nested folders
       if ( !SD_mounted )                                   // Init (mount) okay?
       {
         //ESP_LOGE ( STAG, "SD Card Mount Failed!" ) ;     // No success, check formatting (FAT)
@@ -817,26 +828,27 @@ struct mp3spec_t                                      // For List of mp3 file on
       if ( SDInsertCheck() )                              // See if new card is inserted
       {
         SD_lastmp3spec[0] = '\0' ;                        // No last track
-        if ( ( openTrackfile() ) &&                       // Try to open trackfile
-             ( trackfile.size() > 0 ) )                   // Tracklist on this SD card?
+        SD_filecount = 0 ;
+        closeTrackfile() ;
+        if ( SD.exists ( TRACKLIST ) && !SD.remove ( TRACKLIST ) )
         {
-          ESP_LOGI ( STAG, "Track list is on SD card, "   // Yes, show it
-                     "read tracks" ) ;
-          SD_filecount = countfiles() ;                   // Count number of files on this card
-          closeTrackfile() ;                              // Close the tracklist file
-          ESP_LOGI ( STAG, "%d tracks on SD card",        // Yes, show it
-                     SD_filecount ) ;
+          ESP_LOGE ( STAG, "Cannot replace stale %s", TRACKLIST ) ;
+          SD_okay = false ;
         }
         else
         {
-          ESP_LOGI ( STAG, "Locate mp3 files on SD, "
-                     "may take a while..." ) ;
+          ESP_LOGI ( STAG, "Scan MP3 folders and rebuild %s", TRACKLIST ) ;
           if ( openTrackfile ( FILE_WRITE ) )             // Try to open trackfile for write
           {
             SD_okay = getsdtracks ( "/", SD_MAXDEPTH ) ;  // Get filenames, store on the SD card
             closeTrackfile() ;                            // Close the tracklist file
           }
+          else
+          {
+            SD_okay = false ;
+          }
         }
+        ESP_LOGI ( STAG, "%d tracks in folders on SD card", SD_filecount ) ;
         ffn = getFirstSDFileName() ;
         if ( ffn )
         {

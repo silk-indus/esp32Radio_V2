@@ -117,7 +117,7 @@
 
 //
 // Define the version number, the format used is the HTTP standard.
-#define VERSION     "Tue, 15 Sep 2026 13:00:00 GMT"
+#define VERSION     "Tue, 15 Sep 2026 15:30:00 GMT"
 //
 #include <Arduino.h>                                      // Standard include for Platformio Arduino projects
 #include "soc/soc.h"                                      // For brown-out detector setting
@@ -406,10 +406,20 @@ uint32_t             station_number_time = 0 ;           // Time of the latest e
 bool                 station_list_active = false ;        // Full-screen station list is visible
 bool                 station_list_sd = false ;            // Full-screen list currently shows SD tracks
 int16_t              station_list_preset = 0 ;            // Preset selected in station list
-int16_t              station_list_sd_index = 0 ;          // Track selected in SD list
+int16_t              station_list_sd_index = 0 ;          // Selected entry in current SD folder
 uint16_t             station_list_scroll = 0 ;            // UTF-8 character offset in station title
 uint32_t             station_list_scroll_time = 0 ;       // Time of the latest marquee step
 bool                 station_list_scroll_needed = false ; // Selected title exceeds its row width
+#ifdef SDCARD
+struct sd_browser_entry_t
+{
+  String path ;                                           // Full track or directory path
+  String label ;                                          // Name shown in the current directory
+  bool   directory ;                                      // Click opens a directory instead of playing
+} ;
+std::vector<sd_browser_entry_t> sd_browser_entries ;      // Visible entries in current MP3 folder
+String               sd_browser_directory = "/" ;         // Current MP3 browser directory
+#endif
 const char*          fixedwifi = "" ;                    // Used for FIXEDWIFI option
 #ifndef ETHERNET
 std::vector<WifiInfo_t> wifilist ;                        // Credentials tried directly in list order
@@ -2131,6 +2141,110 @@ static bool findPreset ( int16_t start, int8_t direction, uint8_t count,
   return true ;
 }
 
+#ifdef SDCARD
+static void addSDBrowserEntry ( const String& path, const String& label, bool directory )
+{
+  if ( directory )                                        // A folder may contain many flattened tracks
+  {
+    for ( size_t i = 0 ; i < sd_browser_entries.size() ; i++ )
+    {
+      if ( sd_browser_entries[i].directory && sd_browser_entries[i].path == path ) return ;
+    }
+  }
+  sd_browser_entry_t entry ;
+  entry.path = path ;
+  entry.label = label ;
+  entry.directory = directory ;
+  sd_browser_entries.push_back ( entry ) ;
+}
+
+static bool sdBrowserEntryBefore ( const sd_browser_entry_t& left,
+                                   const sd_browser_entry_t& right )
+{
+  if ( left.label == "[..]" ) return true ;               // Parent is always the first row
+  if ( right.label == "[..]" ) return false ;
+  if ( left.directory != right.directory ) return left.directory ; // Folders before tracks
+  return left.label.compareTo ( right.label ) < 0 ;
+}
+
+static bool loadSDBrowserDirectory ( const String& requestedDirectory )
+{
+  if ( SD_filecount <= 0 ) return false ;
+  int16_t savedIndex = SD_curindex ;
+  String savedPath = String ( getCurrentSDFileName() ) ;
+  bool savedRandomPlay = randomplay ;
+  String directory = requestedDirectory.length() ? requestedDirectory : String ( "/" ) ;
+  if ( directory[0] != '/' ) directory = String ( "/" ) + directory ;
+  while ( directory.length() > 1 && directory.endsWith ( "/" ) )
+  {
+    directory.remove ( directory.length() - 1 ) ;
+  }
+
+  sd_browser_entries.clear() ;
+  if ( directory != "/" )
+  {
+    int slash = directory.lastIndexOf ( '/' ) ;
+    String parent = slash <= 0 ? String ( "/" ) : directory.substring ( 0, slash ) ;
+    addSDBrowserEntry ( parent, "[..]", true ) ;
+  }
+
+  String prefix = directory == "/" ? String ( "/" ) : directory + "/" ;
+  for ( int16_t track = 0 ; track < SD_filecount ; track++ )
+  {
+    const char* filename = getSDFileName ( track ) ;
+    if ( !filename ) continue ;
+    String fullPath = String ( filename ) ;
+    if ( !fullPath.startsWith ( prefix ) ) continue ;
+    String relativePath = fullPath.substring ( prefix.length() ) ;
+    if ( relativePath.length() == 0 ) continue ;
+    int slash = relativePath.indexOf ( '/' ) ;
+    if ( slash >= 0 )
+    {
+      String folder = relativePath.substring ( 0, slash ) ;
+      String folderPath = directory == "/" ? String ( "/" ) + folder : directory + "/" + folder ;
+      addSDBrowserEntry ( folderPath, String ( "[" ) + folder + "]", true ) ;
+    }
+    else
+    {
+      String label = relativePath ;
+      int dot = label.lastIndexOf ( '.' ) ;
+      if ( dot > 0 ) label.remove ( dot ) ;
+      addSDBrowserEntry ( fullPath, label, false ) ;
+    }
+  }
+
+  for ( size_t i = 1 ; i < sd_browser_entries.size() ; i++ ) // Small insertion sort, no STL extras
+  {
+    sd_browser_entry_t item = sd_browser_entries[i] ;
+    size_t position = i ;
+    while ( position > 0 && sdBrowserEntryBefore ( item, sd_browser_entries[position - 1] ) )
+    {
+      sd_browser_entries[position] = sd_browser_entries[position - 1] ;
+      position-- ;
+    }
+    sd_browser_entries[position] = item ;
+  }
+
+  if ( savedIndex >= 0 && savedIndex < SD_filecount ) getSDFileName ( savedIndex ) ;
+  else if ( savedPath.length() ) setSDFileName ( savedPath.c_str() ) ;
+  randomplay = savedRandomPlay ;
+  sd_browser_directory = directory ;
+  ESP_LOGI ( TAG, "MP3 folder %s contains %u entries",
+             sd_browser_directory.c_str(), (unsigned)sd_browser_entries.size() ) ;
+  return !sd_browser_entries.empty() ;
+}
+
+static int16_t findSDTrackIndex ( const String& requestedPath )
+{
+  for ( int16_t track = 0 ; track < SD_filecount ; track++ )
+  {
+    const char* filename = getSDFileName ( track ) ;
+    if ( filename && requestedPath == filename ) return track ;
+  }
+  return -1 ;
+}
+#endif
+
 static void restoreRadioView()
 {
   station_list_active = false ;
@@ -2171,7 +2285,7 @@ static void drawStationList ( bool selectedOnly = false )
     if ( station_list_sd )
     {
       #ifdef SDCARD
-      if ( SD_filecount <= 0 ) return ;
+      if ( sd_browser_entries.empty() ) return ;
       if ( !selectedOnly )
       {
         for ( int8_t row = middle - 1 ; row >= 0 ; row-- )
@@ -2200,24 +2314,15 @@ static void drawStationList ( bool selectedOnly = false )
     }
     uint8_t firstRow = selectedOnly ? middle : 0 ;
     uint8_t lastRow = selectedOnly ? middle + 1 : rowCount ;
-    #ifdef SDCARD
-      int16_t savedSDIndex = SD_curindex ;
-      bool savedRandomPlay = randomplay ;
-    #endif
     for ( uint8_t row = firstRow ; row < lastRow ; row++ )
     {
       String host, name ;
       if ( station_list_sd )
       {
         #ifdef SDCARD
-          if ( rowPreset[row] >= 0 && rowPreset[row] < SD_filecount )
+          if ( rowPreset[row] >= 0 && rowPreset[row] < (int16_t)sd_browser_entries.size() )
           {
-            const char* path = getSDFileName ( rowPreset[row] ) ;
-            name = path ? String ( path ) : String ( "" ) ;
-            int slash = name.lastIndexOf ( '/' ) ;
-            if ( slash >= 0 ) name.remove ( 0, slash + 1 ) ;
-            int dot = name.lastIndexOf ( '.' ) ;
-            if ( dot > 0 ) name.remove ( dot ) ;
+            name = sd_browser_entries[rowPreset[row]].label ;
           }
         #endif
       }
@@ -2230,10 +2335,9 @@ static void drawStationList ( bool selectedOnly = false )
       if ( station_list_sd )
       {
         #ifdef SDCARD
-          if ( rowPreset[row] >= 0 && rowPreset[row] < SD_filecount )
+          if ( rowPreset[row] >= 0 && rowPreset[row] < (int16_t)sd_browser_entries.size() )
           {
-            rowText[row] = String ( row == middle ? ">" : " " ) +
-                           String ( rowPreset[row] + 1 ) + " " + name ;
+            rowText[row] = String ( row == middle ? "> " : "  " ) + name ;
           }
           else
           {
@@ -2250,13 +2354,6 @@ static void drawStationList ( bool selectedOnly = false )
       }
       rows[row] = rowText[row].c_str() ;
     }
-    #ifdef SDCARD
-      if ( station_list_sd && savedSDIndex >= 0 && savedSDIndex < SD_filecount )
-      {
-        getSDFileName ( savedSDIndex ) ;                 // Browsing must not change current track
-        randomplay = savedRandomPlay ;
-      }
-    #endif
     station_list_scroll_needed =
       bluetft_drawStationList ( rows, rowCount, middle,
                                 station_list_scroll, selectedOnly ) ;
@@ -2331,11 +2428,13 @@ void openSDList()
     station_number_entry = false ;
     station_number_input = "" ;
     station_list_sd = true ;
-    station_list_sd_index = SD_curindex ;
-    if ( station_list_sd_index < 0 || station_list_sd_index >= SD_filecount )
+    if ( !loadSDBrowserDirectory ( "/" ) )
     {
-      station_list_sd_index = 0 ;
+      ESP_LOGI ( TAG, "No MP3 entries in root folder browser" ) ;
+      station_list_sd = false ;
+      return ;
     }
+    station_list_sd_index = 0 ;
     station_list_active = true ;
     enc_menu_mode = VOLUME ;                            // List flag handles navigation, not legacy mode
     enc_inactivity = 0 ;
@@ -2343,7 +2442,8 @@ void openSDList()
     station_list_scroll = 0 ;
     station_list_scroll_time = millis() ;
     drawStationList() ;
-    ESP_LOGI ( TAG, "SD track list opened with %d entries", SD_filecount ) ;
+    ESP_LOGI ( TAG, "SD folder browser opened with %u root entries and %d tracks",
+               (unsigned)sd_browser_entries.size(), SD_filecount ) ;
   #else
     ESP_LOGI ( TAG, "SD support is disabled" ) ;
   #endif
@@ -2357,10 +2457,10 @@ void moveStationList ( int8_t direction, uint8_t count )
   #ifdef SDCARD
     if ( station_list_sd )
     {
-      if ( SD_filecount <= 0 ) return ;
+      if ( sd_browser_entries.empty() ) return ;
       int32_t next = station_list_sd_index + ( (int32_t)direction * count ) ;
       if ( next < 0 ) next = 0 ;
-      if ( next >= SD_filecount ) next = SD_filecount - 1 ;
+      if ( next >= (int32_t)sd_browser_entries.size() ) next = sd_browser_entries.size() - 1 ;
       if ( next == station_list_sd_index ) return ;
       station_list_sd_index = next ;
       station_list_scroll = 0 ;
@@ -2389,16 +2489,33 @@ void confirmStationList()
   #ifdef SDCARD
     if ( station_list_sd )
     {
-      int16_t requested = station_list_sd_index ;
-      const char* path = getSDFileName ( requested ) ;
-      if ( path && *path )
+      if ( station_list_sd_index < 0 ||
+           station_list_sd_index >= (int16_t)sd_browser_entries.size() ) return ;
+      sd_browser_entry_t selected = sd_browser_entries[station_list_sd_index] ;
+      if ( selected.directory )
       {
-        String selectedPath = String ( path ) ;
+        if ( loadSDBrowserDirectory ( selected.path ) )
+        {
+          station_list_sd_index = 0 ;
+          station_list_scroll = 0 ;
+          station_list_scroll_time = millis() ;
+          encoder_menu_activity_time = millis() ;
+          drawStationList() ;
+        }
+        return ;
+      }
+      int16_t requested = findSDTrackIndex ( selected.path ) ;
+      if ( requested >= 0 )
+      {
         restoreRadioView() ;
-        getSDFileName ( requested ) ;                     // Restore after display redraw activity
-        ESP_LOGI ( TAG, "SD list selected track %d: %s",
-                   requested + 1, selectedPath.c_str() ) ;
+        getSDFileName ( requested ) ;                     // Align flat playback index with selected file
+        ESP_LOGI ( TAG, "SD browser selected track %d: %s",
+                   requested + 1, selected.path.c_str() ) ;
         myQueueSend ( sdqueue, &startcmd ) ;
+      }
+      else
+      {
+        ESP_LOGE ( TAG, "Selected MP3 disappeared from track list: %s", selected.path.c_str() ) ;
       }
       return ;
     }
@@ -3380,7 +3497,7 @@ void setup()
   ESP_LOGI ( TAG, "Version %s.  Free memory %d",
              VERSION,
              heapspace ) ;                                // Normally about 100 kB
-  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V26-20260915" ) ; // Pin information matches installed hardware
+  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V28-20260915" ) ; // Hierarchical MP3 folder browser
   ESP_LOGI ( TAG, "Display type is %s", DISPLAYTYPE ) ;   // Report display option
   
   if ( !SPIFFS.begin ( FSIF ) )                           // Mount and test SPIFFS
@@ -5367,7 +5484,23 @@ const char* analyzeCmd ( const char* par, const char* val )
   }
   else if ( argument == "preset" )                    // (UP/DOWN)Preset station?
   {
-    if ( nextPreset ( ivalue, relative ) )             // Yes, set new preset
+    bool presetFound = false ;
+    int16_t requestedPreset = ivalue ;
+    if ( relative && presetinfo.station_state == ST_PRESET && ivalue != 0 )
+    {
+      uint16_t requestedSteps = ivalue < 0 ? -ivalue : ivalue ;
+      uint8_t steps = requestedSteps > 255 ? 255 : requestedSteps ;
+      int8_t direction = ivalue < 0 ? -1 : 1 ;
+      if ( findPreset ( presetinfo.preset, direction, steps, &requestedPreset ) )
+      {
+        presetFound = nextPreset ( requestedPreset, false ) ;
+      }
+    }
+    else
+    {
+      presetFound = nextPreset ( ivalue, relative ) ;
+    }
+    if ( presetFound )                                  // Valid configured preset found?
     {
       sprintf ( reply, "Preset is now %d",            // Reply new preset
                 presetinfo.preset ) ;
@@ -5375,7 +5508,7 @@ const char* analyzeCmd ( const char* par, const char* val )
     }
     else
     {
-      sprintf ( reply, "Preset %d does not exist", ivalue ) ;
+      strcpy ( reply, "No configured preset in requested direction" ) ;
     }
   }
 #ifdef SDCARD
