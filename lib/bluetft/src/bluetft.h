@@ -80,6 +80,7 @@ void bluetft_drawStationNumber ( const char* str, uint16_t color ) ;
 void bluetft_drawTrackNumber ( const char* str, uint16_t color ) ;
 bool bluetft_drawStationList ( const char* const* rows, uint8_t count,
                                uint8_t selectedRow, uint16_t scrollOffset,
-                               bool selectedOnly = false ) ;
+                               bool selectedOnly = false,
+                               const uint16_t* rowColors = nullptr ) ;
 bool bluetft_dsp_begin      ( int8_t cs, int8_t dc ) ;
 #endif

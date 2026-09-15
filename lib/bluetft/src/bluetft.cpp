@@ -699,7 +699,7 @@ static String rotateUtf8Cycle ( const String& title, uint16_t characterOffset )
 
 bool bluetft_drawStationList ( const char* const* rows, uint8_t count,
                                uint8_t selectedRow, uint16_t scrollOffset,
-                               bool selectedOnly )
+                               bool selectedOnly, const uint16_t* rowColors )
 {
   if ( !bluetft_tft || !rows || !fontArialBold11.ready() ) return false ;
   if ( !selectedOnly ) dsp_erase() ;
@@ -714,8 +714,10 @@ bool bluetft_drawStationList ( const char* const* rows, uint8_t count,
       y += lineHeight ;
       continue ;
     }
-    uint16_t background = selected ? YELLOW : BLACK ;
-    uint16_t foreground = selected ? BLACK : WHITE ;
+    uint16_t rowColor = rowColors ? rowColors[row] : WHITE ;
+    bool actionRow = rowColor == BLUE ;
+    uint16_t background = selected ? ( actionRow ? BLUE : YELLOW ) : BLACK ;
+    uint16_t foreground = selected ? ( actionRow ? WHITE : BLACK ) : rowColor ;
 
     String complete = rows[row] ;
     int separator = complete.indexOf ( ' ', 1 ) ;

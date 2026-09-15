@@ -117,7 +117,7 @@
 
 //
 // Define the version number, the format used is the HTTP standard.
-#define VERSION     "Tue, 15 Sep 2026 15:30:00 GMT"
+#define VERSION     "Tue, 15 Sep 2026 21:00:00 GMT"
 //
 #include <Arduino.h>                                      // Standard include for Platformio Arduino projects
 #include "soc/soc.h"                                      // For brown-out detector setting
@@ -243,6 +243,8 @@ struct qdata_struct                                   // Data in queue for playt
   qdata_type                          datatyp ;       // Identifier
   __attribute__((aligned(4))) uint8_t buf[32] ;       // Buffer for chunk of mp3 data
 } ;
+
+void queueToPt ( qdata_type func ) ;                  // Used by SD hot-plug handling
 
 struct ini_struct
 {
@@ -393,6 +395,9 @@ uint32_t             ir_0 = 550 ;                        // Average duration of 
 uint32_t             ir_1 = 1650 ;                       // Average duration of an IR long pulse
 struct tm            timeinfo ;                          // Will be filled by NTP server
 bool                 time_req = false ;                  // Set time requested
+volatile bool        playback_started = false ;          // First decoder start has been received
+volatile uint32_t    playback_started_time = 0 ;         // Delay NTP until audio is safely running
+bool                 time_sync_configured = false ;      // configTime() is deferred until playback
 uint16_t             adcvalraw ;                         // ADC value (raw)
 uint16_t             adcval ;                            // ADC value (battery voltage, averaged)
 uint32_t             clength ;                           // Content length found in http header
@@ -416,9 +421,15 @@ struct sd_browser_entry_t
   String path ;                                           // Full track or directory path
   String label ;                                          // Name shown in the current directory
   bool   directory ;                                      // Click opens a directory instead of playing
+  uint8_t action ;                                        // 0=file/folder, 1=play folder, 2=random
 } ;
 std::vector<sd_browser_entry_t> sd_browser_entries ;      // Visible entries in current MP3 folder
 String               sd_browser_directory = "/" ;         // Current MP3 browser directory
+enum sd_folder_mode_t { SD_FOLDER_OFF, SD_FOLDER_ASCENDING, SD_FOLDER_RANDOM } ;
+sd_folder_mode_t     sd_folder_mode = SD_FOLDER_OFF ;     // Optional loop limited to one folder
+std::vector<int16_t> sd_folder_order ;                    // Flat track indices in playback order
+size_t               sd_folder_position = 0 ;             // Current item inside folder order
+String               sd_folder_play_directory = "/" ;    // Folder whose tracks are looping
 #endif
 const char*          fixedwifi = "" ;                    // Used for FIXEDWIFI option
 #ifndef ETHERNET
@@ -923,6 +934,14 @@ void queueToPt ( qdata_type func )
   specchunk.datatyp = func ;                              // Put function in datatyp
   xQueueSendToFront ( dataqueue, &specchunk, 200 ) ;      // Send to queue (First Out)
   vTaskDelay ( 1 ) ;                                      // Give Play task time to react
+}
+
+void notePlaybackStarted()
+{
+  if ( playback_started ) return ;
+  playback_started_time = millis() ;
+  playback_started = true ;
+  ESP_LOGI ( TAG, "Playback started; NTP will begin after 2 seconds" ) ;
 }
 
 
@@ -2142,7 +2161,8 @@ static bool findPreset ( int16_t start, int8_t direction, uint8_t count,
 }
 
 #ifdef SDCARD
-static void addSDBrowserEntry ( const String& path, const String& label, bool directory )
+static void addSDBrowserEntry ( const String& path, const String& label,
+                                bool directory, uint8_t action = 0 )
 {
   if ( directory )                                        // A folder may contain many flattened tracks
   {
@@ -2155,15 +2175,24 @@ static void addSDBrowserEntry ( const String& path, const String& label, bool di
   entry.path = path ;
   entry.label = label ;
   entry.directory = directory ;
+  entry.action = action ;
   sd_browser_entries.push_back ( entry ) ;
+}
+
+static uint8_t sdBrowserEntryRank ( const sd_browser_entry_t& entry )
+{
+  if ( entry.action == 1 ) return 0 ;
+  if ( entry.action == 2 ) return 1 ;
+  if ( entry.label == "[..]" ) return 2 ;
+  return entry.directory ? 3 : 4 ;
 }
 
 static bool sdBrowserEntryBefore ( const sd_browser_entry_t& left,
                                    const sd_browser_entry_t& right )
 {
-  if ( left.label == "[..]" ) return true ;               // Parent is always the first row
-  if ( right.label == "[..]" ) return false ;
-  if ( left.directory != right.directory ) return left.directory ; // Folders before tracks
+  uint8_t leftRank = sdBrowserEntryRank ( left ) ;
+  uint8_t rightRank = sdBrowserEntryRank ( right ) ;
+  if ( leftRank != rightRank ) return leftRank < rightRank ;
   return left.label.compareTo ( right.label ) < 0 ;
 }
 
@@ -2187,8 +2216,11 @@ static bool loadSDBrowserDirectory ( const String& requestedDirectory )
     String parent = slash <= 0 ? String ( "/" ) : directory.substring ( 0, slash ) ;
     addSDBrowserEntry ( parent, "[..]", true ) ;
   }
+  addSDBrowserEntry ( directory, "Play folder", false, 1 ) ;
+  addSDBrowserEntry ( directory, "Random", false, 2 ) ;
 
   String prefix = directory == "/" ? String ( "/" ) : directory + "/" ;
+  bool folderHasContent = false ;
   for ( int16_t track = 0 ; track < SD_filecount ; track++ )
   {
     const char* filename = getSDFileName ( track ) ;
@@ -2203,6 +2235,7 @@ static bool loadSDBrowserDirectory ( const String& requestedDirectory )
       String folder = relativePath.substring ( 0, slash ) ;
       String folderPath = directory == "/" ? String ( "/" ) + folder : directory + "/" + folder ;
       addSDBrowserEntry ( folderPath, String ( "[" ) + folder + "]", true ) ;
+      folderHasContent = true ;
     }
     else
     {
@@ -2210,6 +2243,7 @@ static bool loadSDBrowserDirectory ( const String& requestedDirectory )
       int dot = label.lastIndexOf ( '.' ) ;
       if ( dot > 0 ) label.remove ( dot ) ;
       addSDBrowserEntry ( fullPath, label, false ) ;
+      folderHasContent = true ;
     }
   }
 
@@ -2231,7 +2265,16 @@ static bool loadSDBrowserDirectory ( const String& requestedDirectory )
   sd_browser_directory = directory ;
   ESP_LOGI ( TAG, "MP3 folder %s contains %u entries",
              sd_browser_directory.c_str(), (unsigned)sd_browser_entries.size() ) ;
-  return !sd_browser_entries.empty() ;
+  return folderHasContent ;
+}
+
+static int16_t firstSDBrowserContentIndex()
+{
+  for ( size_t i = 0 ; i < sd_browser_entries.size() ; i++ )
+  {
+    if ( sd_browser_entries[i].action == 0 ) return (int16_t)i ; // Parent, folder or track
+  }
+  return sd_browser_entries.empty() ? -1 : 0 ;
 }
 
 static int16_t findSDTrackIndex ( const String& requestedPath )
@@ -2242,6 +2285,118 @@ static int16_t findSDTrackIndex ( const String& requestedPath )
     if ( filename && requestedPath == filename ) return track ;
   }
   return -1 ;
+}
+
+static void clearSDFolderPlayback()
+{
+  sd_folder_mode = SD_FOLDER_OFF ;
+  sd_folder_order.clear() ;
+  sd_folder_position = 0 ;
+  sd_folder_play_directory = "/" ;
+}
+
+struct sd_folder_track_t
+{
+  String  path ;
+  int16_t index ;
+} ;
+
+static bool startSDFolderPlayback ( const String& requestedDirectory, bool randomOrder )
+{
+  String directory = requestedDirectory.length() ? requestedDirectory : String ( "/" ) ;
+  if ( directory[0] != '/' ) directory = String ( "/" ) + directory ;
+  while ( directory.length() > 1 && directory.endsWith ( "/" ) )
+  {
+    directory.remove ( directory.length() - 1 ) ;
+  }
+  String prefix = directory == "/" ? String ( "/" ) : directory + "/" ;
+  std::vector<int16_t> previousOrder ;
+  if ( randomOrder && sd_folder_mode == SD_FOLDER_RANDOM &&
+       sd_folder_play_directory == directory ) previousOrder = sd_folder_order ;
+
+  int16_t savedIndex = SD_curindex ;
+  String savedPath = String ( getCurrentSDFileName() ) ;
+  bool savedRandomPlay = randomplay ;
+  std::vector<sd_folder_track_t> tracks ;
+  for ( int16_t track = 0 ; track < SD_filecount ; track++ )
+  {
+    const char* filename = getSDFileName ( track ) ;
+    if ( filename && String ( filename ).startsWith ( prefix ) )
+    {
+      sd_folder_track_t item ;
+      item.path = filename ;
+      item.index = track ;
+      tracks.push_back ( item ) ;
+    }
+  }
+  if ( tracks.empty() )
+  {
+    if ( savedIndex >= 0 && savedIndex < SD_filecount ) getSDFileName ( savedIndex ) ;
+    else if ( savedPath.length() ) setSDFileName ( savedPath.c_str() ) ;
+    randomplay = savedRandomPlay ;
+    return false ;
+  }
+
+  for ( size_t i = 1 ; i < tracks.size() ; i++ )          // Ascending full path and filename
+  {
+    sd_folder_track_t item = tracks[i] ;
+    size_t position = i ;
+    while ( position > 0 && item.path.compareTo ( tracks[position - 1].path ) < 0 )
+    {
+      tracks[position] = tracks[position - 1] ;
+      position-- ;
+    }
+    tracks[position] = item ;
+  }
+
+  sd_folder_order.clear() ;
+  for ( size_t i = 0 ; i < tracks.size() ; i++ ) sd_folder_order.push_back ( tracks[i].index ) ;
+  if ( randomOrder )
+  {
+    for ( size_t i = sd_folder_order.size() - 1 ; i > 0 ; i-- )
+    {
+      size_t other = (size_t)random ( (long)i + 1 ) ;
+      int16_t swap = sd_folder_order[i] ;
+      sd_folder_order[i] = sd_folder_order[other] ;
+      sd_folder_order[other] = swap ;
+    }
+    bool same = previousOrder.size() == sd_folder_order.size() ;
+    for ( size_t i = 0 ; same && i < sd_folder_order.size() ; i++ )
+    {
+      if ( previousOrder[i] != sd_folder_order[i] ) same = false ;
+    }
+    if ( same && sd_folder_order.size() > 1 )             // Every click produces a different order
+    {
+      int16_t first = sd_folder_order[0] ;
+      for ( size_t i = 1 ; i < sd_folder_order.size() ; i++ )
+      {
+        sd_folder_order[i - 1] = sd_folder_order[i] ;
+      }
+      sd_folder_order[sd_folder_order.size() - 1] = first ;
+    }
+  }
+
+  sd_folder_mode = randomOrder ? SD_FOLDER_RANDOM : SD_FOLDER_ASCENDING ;
+  sd_folder_play_directory = directory ;
+  sd_folder_position = 0 ;
+  randomplay = false ;                                    // Explicit shuffled indices handle randomness
+  return getSDFileName ( sd_folder_order[0] ) != NULL ;
+}
+
+static bool stepSDFolderPlayback ( int8_t direction )
+{
+  if ( sd_folder_mode == SD_FOLDER_OFF || sd_folder_order.empty() ) return false ;
+  if ( direction < 0 )
+  {
+    sd_folder_position = sd_folder_position == 0 ?
+                         sd_folder_order.size() - 1 : sd_folder_position - 1 ;
+  }
+  else
+  {
+    sd_folder_position = ( sd_folder_position + 1 ) % sd_folder_order.size() ;
+  }
+  randomplay = false ;
+  return getSDFileName ( sd_folder_order[sd_folder_position] ) != NULL ;
 }
 #endif
 
@@ -2280,7 +2435,9 @@ static void drawStationList ( bool selectedOnly = false )
     const uint8_t middle = rowCount / 2 ;
     String rowText[rowCount] ;
     const char* rows[rowCount] ;
+    uint16_t rowColors[rowCount] ;
     int16_t rowPreset[rowCount] ;
+    for ( uint8_t row = 0 ; row < rowCount ; row++ ) rowColors[row] = WHITE ;
     rowPreset[middle] = station_list_sd ? station_list_sd_index : station_list_preset ;
     if ( station_list_sd )
     {
@@ -2323,6 +2480,7 @@ static void drawStationList ( bool selectedOnly = false )
           if ( rowPreset[row] >= 0 && rowPreset[row] < (int16_t)sd_browser_entries.size() )
           {
             name = sd_browser_entries[rowPreset[row]].label ;
+            if ( sd_browser_entries[rowPreset[row]].action ) rowColors[row] = BLUE ;
           }
         #endif
       }
@@ -2356,7 +2514,7 @@ static void drawStationList ( bool selectedOnly = false )
     }
     station_list_scroll_needed =
       bluetft_drawStationList ( rows, rowCount, middle,
-                                station_list_scroll, selectedOnly ) ;
+                                station_list_scroll, selectedOnly, rowColors ) ;
   #else
     String host, name ;
     readhostfrompref ( station_list_preset, &host, &name ) ;
@@ -2428,13 +2586,24 @@ void openSDList()
     station_number_entry = false ;
     station_number_input = "" ;
     station_list_sd = true ;
-    if ( !loadSDBrowserDirectory ( "/" ) )
+    String initialDirectory = "/" ;
+    if ( SD_playing )
     {
-      ESP_LOGI ( TAG, "No MP3 entries in root folder browser" ) ;
-      station_list_sd = false ;
-      return ;
+      String currentTrack = String ( getCurrentSDFileName() ) ;
+      int slash = currentTrack.lastIndexOf ( '/' ) ;
+      if ( slash > 0 ) initialDirectory = currentTrack.substring ( 0, slash ) ;
     }
-    station_list_sd_index = 0 ;
+    if ( !loadSDBrowserDirectory ( initialDirectory ) )
+    {
+      initialDirectory = "/" ;                            // Damaged/stale path: safely use root
+      if ( !loadSDBrowserDirectory ( initialDirectory ) )
+      {
+        ESP_LOGI ( TAG, "No MP3 entries in folder browser" ) ;
+        station_list_sd = false ;
+        return ;
+      }
+    }
+    station_list_sd_index = firstSDBrowserContentIndex() ;
     station_list_active = true ;
     enc_menu_mode = VOLUME ;                            // List flag handles navigation, not legacy mode
     enc_inactivity = 0 ;
@@ -2442,7 +2611,8 @@ void openSDList()
     station_list_scroll = 0 ;
     station_list_scroll_time = millis() ;
     drawStationList() ;
-    ESP_LOGI ( TAG, "SD folder browser opened with %u root entries and %d tracks",
+    ESP_LOGI ( TAG, "SD folder browser opened at %s with %u entries and %d tracks",
+               sd_browser_directory.c_str(),
                (unsigned)sd_browser_entries.size(), SD_filecount ) ;
   #else
     ESP_LOGI ( TAG, "SD support is disabled" ) ;
@@ -2492,11 +2662,30 @@ void confirmStationList()
       if ( station_list_sd_index < 0 ||
            station_list_sd_index >= (int16_t)sd_browser_entries.size() ) return ;
       sd_browser_entry_t selected = sd_browser_entries[station_list_sd_index] ;
+      if ( selected.action )
+      {
+        bool shuffled = selected.action == 2 ;
+        if ( startSDFolderPlayback ( selected.path, shuffled ) )
+        {
+          size_t folderTrackCount = sd_folder_order.size() ;
+          String folder = sd_folder_play_directory ;
+          restoreRadioView() ;
+          ESP_LOGI ( TAG, "%s %u tracks from folder %s",
+                     shuffled ? "Randomized" : "Playing",
+                     (unsigned)folderTrackCount, folder.c_str() ) ;
+          myQueueSend ( sdqueue, &startcmd ) ;
+        }
+        else
+        {
+          ESP_LOGI ( TAG, "No MP3 tracks in folder %s", selected.path.c_str() ) ;
+        }
+        return ;
+      }
       if ( selected.directory )
       {
         if ( loadSDBrowserDirectory ( selected.path ) )
         {
-          station_list_sd_index = 0 ;
+          station_list_sd_index = firstSDBrowserContentIndex() ;
           station_list_scroll = 0 ;
           station_list_scroll_time = millis() ;
           encoder_menu_activity_time = millis() ;
@@ -2507,6 +2696,7 @@ void confirmStationList()
       int16_t requested = findSDTrackIndex ( selected.path ) ;
       if ( requested >= 0 )
       {
+        clearSDFolderPlayback() ;                         // A single track returns to global autoplay
         restoreRadioView() ;
         getSDFileName ( requested ) ;                     // Align flat playback index with selected file
         ESP_LOGI ( TAG, "SD browser selected track %d: %s",
@@ -3497,7 +3687,7 @@ void setup()
   ESP_LOGI ( TAG, "Version %s.  Free memory %d",
              VERSION,
              heapspace ) ;                                // Normally about 100 kB
-  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V28-20260915" ) ; // Hierarchical MP3 folder browser
+  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V34-20260915" ) ; // UTF-16/Latin-1/UTF-8 ID3 text
   ESP_LOGI ( TAG, "Display type is %s", DISPLAYTYPE ) ;   // Report display option
   
   if ( !SPIFFS.begin ( FSIF ) )                           // Mount and test SPIFFS
@@ -3713,9 +3903,6 @@ void setup()
   timerAlarmWrite ( timer, 100000, true ) ;              // Alarm every 100 msec
   timerAlarmEnable ( timer ) ;                           // Enable the timer
   vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;             // Show IP for a while
-  configTime ( ini_block.clk_offset * 3600,
-               ini_block.clk_dst * 3600,
-               ini_block.clk_server.c_str() ) ;          // GMT offset, daylight offset in seconds
   timeinfo.tm_year = 0 ;                                 // Set TOD to illegal
   // Init settings for rotary switch (if existing).
   #ifdef ZIPPYB5
@@ -3762,10 +3949,6 @@ void setup()
                 ini_block.enc_sw_pin ) ;
     }
   #endif
-  if ( NetworkFound )
-  {
-    gettime() ;                                           // Sync time
-  }
   adc1_config_width ( ADC_WIDTH_12Bit ) ;
   adc1_config_channel_atten ( ADC1_CHANNEL_0, ADC_ATTEN_DB_12 ) ;  // VP/GPIO36 (ESP32), GPIO1 (ESP32-S3)
   xTaskCreatePinnedToCore (
@@ -4532,8 +4715,17 @@ void spfuncs()
     }
     if ( time_req )                                             // Time to refresh timetxt?
     {
-      if ( NetworkFound )                                       // Yes, time available?
+      if ( NetworkFound && playback_started &&
+           millis() - playback_started_time >= 2000 )           // Audio has run for two seconds?
       {
+        if ( !time_sync_configured )
+        {
+          configTime ( ini_block.clk_offset * 3600,
+                       ini_block.clk_dst * 3600,
+                       ini_block.clk_server.c_str() ) ;          // Start SNTP only after playback
+          time_sync_configured = true ;
+          ESP_LOGI ( TAG, "Playback running, NTP synchronization enabled" ) ;
+        }
         gettime() ;                                             // Yes, get the current time
       }
       time_req = false ;                                        // Yes, clear request
@@ -5412,9 +5604,6 @@ const char* analyzeCmd ( const char* par, const char* val )
            argument == "right" || argument == "uppreset" ) )
     {
       const int16_t direction = ( argument == "left" || argument == "downpreset" ) ? -1 : 1 ;
-      int16_t next = SD_curindex + direction ;
-      if ( next < 0 ) next = SD_filecount - 1 ;
-      else if ( next >= SD_filecount ) next = 0 ;
       if ( SD_filecount > 0 )
       {
         if ( SD_cover_visible )
@@ -5422,9 +5611,18 @@ const char* analyzeCmd ( const char* par, const char* val )
           SD_cover_visible = false ;
           restoreRadioView() ;
         }
-        getSDFileName ( next ) ;
+        if ( !stepSDFolderPlayback ( direction ) )
+        {
+          clearSDFolderPlayback() ;
+          int16_t next = SD_curindex + direction ;
+          if ( next < 0 ) next = SD_filecount - 1 ;
+          else if ( next >= SD_filecount ) next = 0 ;
+          getSDFileName ( next ) ;
+        }
         myQueueSend ( sdqueue, &startcmd ) ;
-        strcpy ( reply, direction > 0 ? "MP3 next track" : "MP3 previous track" ) ;
+        strcpy ( reply, sd_folder_mode == SD_FOLDER_OFF ?
+                         ( direction > 0 ? "MP3 next track" : "MP3 previous track" ) :
+                         ( direction > 0 ? "MP3 next folder track" : "MP3 previous folder track" ) ) ;
       }
       else
       {
@@ -5516,21 +5714,32 @@ const char* analyzeCmd ( const char* par, const char* val )
   {
     if ( relative )                                   // Yes. "uptrack" has numeric value
     {
-      getSDFileName ( SD_curindex + ivalue ) ;        // Select next file
+      int16_t count = ivalue < 0 ? -ivalue : ivalue ;
+      int8_t direction = ivalue < 0 ? -1 : 1 ;
+      bool folderStep = sd_folder_mode != SD_FOLDER_OFF ;
+      while ( folderStep && count-- > 0 ) folderStep = stepSDFolderPlayback ( direction ) ;
+      if ( !folderStep )
+      {
+        clearSDFolderPlayback() ;
+        getSDFileName ( SD_curindex + ivalue ) ;      // Select from the complete card
+      }
     }
     else
     {
+      clearSDFolderPlayback() ;
       setSDFileName ( value.c_str() ) ;               // Select new track by filename
     }
     myQueueSend ( sdqueue, &startcmd ) ;              // Signal SDfuncs()
   }
   else if ( argument == "trackinx" )                  // MP3 track request?
   {
+    clearSDFolderPlayback() ;
     getSDFileName ( ivalue ) ;                        // Select file by index
     myQueueSend ( sdqueue, &startcmd ) ;              // Signal SDfuncs()
   }
   else if ( argument == "random" )                    // Random MP3 track request?
   {
+    clearSDFolderPlayback() ;
     getSDFileName ( -1 ) ;                            // Yes, select new random track
     ESP_LOGI ( TAG, "Random file is %s",              // Show filename
                getCurrentSDFileName() ) ;
@@ -5879,6 +6088,7 @@ void playtask ( void * parameter )
             mqttpub.trigger ( MQTT_PLAYING ) ;                        // Request publishing to MQTT
             vs1053player->setVolume ( ini_block.reqvol ) ;            // Unmute
             vs1053player->startSong() ;                               // START, start player
+            notePlaybackStarted() ;                                   // Initial NTP may start afterwards
           }
           break ;
         case QSTOPSONG:
@@ -6039,6 +6249,7 @@ void playtask ( void * parameter )
           mqttpub.trigger ( MQTT_PLAYING ) ;                        // Request publishing to MQTT
           helixInit ( ini_block.shutdown_pin,                       // Enable amplifier output
                       ini_block.shutdownx_pin ) ;                   // Init framebuffering
+          notePlaybackStarted() ;                                  // Initial NTP may start afterwards
           break ;
         case QSTOPSONG:
           ESP_LOGI ( TAG, "Playtask stop song" ) ;
@@ -6156,8 +6367,18 @@ void sdfuncs()
         queueToPt ( QSTOPSONG ) ;                                 // Tell playtask to stop song
         if ( autoplay )                                           // Continue with next track?
         {
-          ESP_LOGI ( TAG, "Autoplay next track" ) ;
-          getNextSDFileName() ;                                   // Select next track
+          if ( stepSDFolderPlayback ( 1 ) )
+          {
+            ESP_LOGI ( TAG, "Folder loop next track %u/%u from %s",
+                       (unsigned)( sd_folder_position + 1 ),
+                       (unsigned)sd_folder_order.size(),
+                       sd_folder_play_directory.c_str() ) ;
+          }
+          else
+          {
+            ESP_LOGI ( TAG, "Autoplay next track" ) ;
+            getNextSDFileName() ;                                 // Select next track on complete card
+          }
           myQueueSend ( sdqueue, &startcmd ) ;                    // Start message to myself
         }
       }

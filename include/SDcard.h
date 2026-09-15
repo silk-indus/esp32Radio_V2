@@ -460,6 +460,81 @@ struct mp3spec_t                                      // For List of mp3 file on
 
 
   //**************************************************************************************************
+  //                                  D E C O D E I D 3 T E X T                                      *
+  //**************************************************************************************************
+  // Convert an ID3 text-frame payload to UTF-8.  The first byte selects ISO-8859-1, UTF-16 with      *
+  // BOM, UTF-16BE, or UTF-8.                                                                         *
+  //**************************************************************************************************
+  String decodeID3Text ( const uint8_t* payload, size_t length )
+  {
+    String result ;
+    if ( !payload || length < 2 ) return result ;
+    uint8_t encoding = payload[0] ;
+    const uint8_t* text = payload + 1 ;
+    size_t left = length - 1 ;
+
+    if ( encoding == 0 || encoding == 3 )                 // ISO-8859-1 or UTF-8
+    {
+      String raw ;
+      raw.reserve ( left ) ;
+      while ( left-- && *text ) raw += (char)*text++ ;    // Ignore the terminating NUL
+      return encoding == 0 ? decodeStreamText ( raw, "iso-8859-1" ) : raw ;
+    }
+
+    if ( encoding != 1 && encoding != 2 ) return result ; // Unknown ID3 text encoding
+    bool littleEndian = false ;                            // Encoding 2 is UTF-16BE without BOM
+    if ( encoding == 1 && left >= 2 )                      // Encoding 1 chooses order with a BOM
+    {
+      if ( text[0] == 0xFF && text[1] == 0xFE ) littleEndian = true ;
+      else if ( text[0] != 0xFE || text[1] != 0xFF )       // Broken BOM: common writers use LE
+      {
+        littleEndian = true ;
+      }
+      if ( ( text[0] == 0xFF && text[1] == 0xFE ) ||
+           ( text[0] == 0xFE && text[1] == 0xFF ) )
+      {
+        text += 2 ;
+        left -= 2 ;
+      }
+    }
+
+    while ( left >= 2 )
+    {
+      uint16_t first = littleEndian ?
+                       ( (uint16_t)text[0] | ( (uint16_t)text[1] << 8 ) ) :
+                       ( ( (uint16_t)text[0] << 8 ) | text[1] ) ;
+      text += 2 ;
+      left -= 2 ;
+      if ( first == 0 ) break ;                            // UTF-16 terminator
+      uint32_t codepoint = first ;
+      if ( first >= 0xD800 && first <= 0xDBFF && left >= 2 )
+      {
+        uint16_t second = littleEndian ?
+                          ( (uint16_t)text[0] | ( (uint16_t)text[1] << 8 ) ) :
+                          ( ( (uint16_t)text[0] << 8 ) | text[1] ) ;
+        if ( second >= 0xDC00 && second <= 0xDFFF )
+        {
+          codepoint = 0x10000UL + ( (uint32_t)( first - 0xD800 ) << 10 ) +
+                      ( second - 0xDC00 ) ;
+          text += 2 ;
+          left -= 2 ;
+        }
+        else
+        {
+          codepoint = 0xFFFD ;                             // Invalid surrogate pair
+        }
+      }
+      else if ( first >= 0xDC00 && first <= 0xDFFF )
+      {
+        codepoint = 0xFFFD ;
+      }
+      result += utf8Codepoint ( codepoint ) ;
+    }
+    return result ;
+  }
+
+
+  //**************************************************************************************************
   //                                  H A N D L E _ I D 3 _ S D                                      *
   //**************************************************************************************************
   // Check file on SD card for ID3 tags and use them to display some info.                           *
@@ -604,13 +679,16 @@ struct mp3spec_t                                      // For List of mp3 file on
         tpe1 = ( strncmp ( ID3tag.tagid, "TPE1", 4 ) == 0 ) ; // Artist?
         if ( tpe1 )                                           // Artist?
         {
-          artist = String ( metalinebf + 1 ) ;                // Artist is the lower field
+          artist = decodeID3Text ( (uint8_t*)metalinebf, stg ) ; // Artist is the lower field
           icyname = artist ;                                  // Also use in web interface
+          ESP_LOGI ( STAG, "ID3 artist: %s", artist.c_str() ) ;
         }
         if ( strncmp ( ID3tag.tagid, "TIT2", 4 ) == 0 )       // Songtitle?
         {
-          tftset ( 1, metalinebf + 1 ) ;                      // Song title is the upper field
-          icystreamtitle = String ( metalinebf + 1 ) ;        // For status in webinterface
+          String title = decodeID3Text ( (uint8_t*)metalinebf, stg ) ;
+          tftset ( 1, title ) ;                               // Song title is the upper field
+          icystreamtitle = title ;                            // For status in webinterface
+          ESP_LOGI ( STAG, "ID3 title: %s", title.c_str() ) ;
         }
       }
       tftset ( 2, artist ) ;                                  // Artist is below the song title
@@ -702,6 +780,11 @@ struct mp3spec_t                                      // For List of mp3 file on
     }
     if ( !okay )
     {
+      if ( SD_mounted )                                  // Do not retain a half-mounted card
+      {
+        SD.end() ;
+        SD_mounted = false ;
+      }
       ESP_LOGI ( STAG, "No SD card attached" ) ;           // Card not readable
     }
     return okay ;
@@ -724,6 +807,27 @@ struct mp3spec_t                                      // For List of mp3 file on
 
 
   //**************************************************************************************************
+  //                                  S D C A R D R E M O V E D                                      *
+  //**************************************************************************************************
+  // Stop all SD activity and forget the old card state.                                             *
+  //**************************************************************************************************
+  void SDCardRemoved()
+  {
+    ESP_LOGI ( STAG, "SD card removed" ) ;
+    mp3filelength = 0 ;                                  // Stop reads from the vanished file
+    closeTrackfile() ;                                   // Do not retain an invalid file handle
+    close_SDCARD() ;
+    if ( dataqueue ) queueToPt ( QSTOPSONG ) ;           // Flush pending audio from the old card
+    if ( SD_mounted ) SD.end() ;                         // Release filesystem and SPI chip select
+    SD_okay = false ;
+    SD_mounted = false ;
+    SD_filecount = 0 ;                                   // Hide the stale track list immediately
+    station_list_active = false ;                        // A visible SD menu is no longer valid
+    station_list_sd = false ;
+  }
+
+
+  //**************************************************************************************************
   //                                   S D I N S E R T C H E C K                                     *
   //**************************************************************************************************
   // Check if new SD card is inserted and can be read.                                               *
@@ -733,9 +837,8 @@ struct mp3spec_t                                      // For List of mp3 file on
     static uint32_t nextCheckTime = 0 ;                     // To prevent checking too often
     uint32_t        newmillis ;                             // Current timestamp
     bool            sdinsNew ;                              // Result of insert check
-    void*           p ;                                     // Pointer to item from ringbuffer
-    size_t          f0 ;                                    // Length of item from ringbuffer
     static bool     sdInserted = false ;                    // Yes, flag for inserted SD
+    static uint8_t  probeFailures = 0 ;                     // Ignore one incidental read failure
     int8_t          dpin = ini_block.sd_detect_pin ;        // SD inserted detect pin
 
     if ( ( newmillis = millis() ) < nextCheckTime )         // Time to check?
@@ -755,25 +858,46 @@ struct mp3spec_t                                      // For List of mp3 file on
         sdInserted = sdinsNew ;                             // Remember status
         if ( ! sdInserted )                                 // Card out?
         {
-          ESP_LOGI ( STAG, "SD card removed" ) ;
-          if ( SD_mounted )                                 // Still mounted?
-          {
-            SD.end() ;                                      // Unmount SD card
-            SD_okay = false ;                               // Not okay anymore
-            SD_mounted = false ;                            // And not mounted anymore
-          }
+          SDCardRemoved() ;                                 // Stop playback and unmount it
         }
         else                                                // Card inserted
         {
           ESP_LOGI ( STAG, "SD card inserted" ) ;
           SD_okay = mount_SDCARD ( ini_block.sd_cs_pin ) ;  // Try to mount
+          if ( !SD_okay ) sdInserted = false ;              // Retry while detect remains LOW
         }
       }
     }
     else                                                    // Handle SD without detect pin
     {
+      if ( SD_mounted && SD_okay )                          // Card was available last time?
+      {
+        File probe = SD.open ( TRACKLIST, FILE_READ ) ;     // One lightweight physical access
+        bool probeOkay = probe &&                          // Force one real data read if non-empty
+                           ( probe.size() == 0 || probe.read() >= 0 ) ;
+        if ( probeOkay )
+        {
+          probe.close() ;
+          probeFailures = 0 ;                              // Healthy: no folder scan is performed
+          return false ;                                   // Not a newly inserted card
+        }
+        if ( ++probeFailures < 2 )                         // Avoid reacting to a transient SPI error
+        {
+          ESP_LOGW ( STAG, "SD presence check failed, will retry" ) ;
+          return false ;
+        }
+        probeFailures = 0 ;
+        SDCardRemoved() ;                                  // Next interval will attempt a new mount
+        return false ;
+      }
       ESP_LOGI ( STAG, "Try to mount SD card" ) ;
       SD_okay = mount_SDCARD ( ini_block.sd_cs_pin ) ;      // Try to mount
+      if ( SD_okay )
+      {
+        sdInserted = true ;
+        probeFailures = 0 ;
+        ESP_LOGI ( STAG, "SD card inserted (polling mode)" ) ;
+      }
     }
     return SD_okay ;                                        // Return result
   }
@@ -807,24 +931,17 @@ struct mp3spec_t                                      // For List of mp3 file on
   //                                       S D T A S K                                               *
   //**************************************************************************************************
   // This task will constantly try to fill the ringbuffer with filenames on SD.                      *
-  // if the SD detect pin is defined, a test will on SD change will be performed every 5 seconds.    *
-  // Otherwise, the check is made only once, after reset.                                            *
+  // Card presence is checked every 5 seconds.  Without a detect pin this is only one lightweight    *
+  // access to tracklist.dat; folders are scanned only after a successful new mount.                 *
   //**************************************************************************************************
   void SDtask ( void * parameter )
   {
     const char* ffn ;                                     // First filename on SD card
-    int8_t      dpin = ini_block.sd_detect_pin ;          // SD inserted detect pin
-    bool        once = true ;                             // Always check once
-  
+
     vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;            // Start delay
     while ( true )                                        // Endless task
     {
       vTaskDelay ( 200 / portTICK_PERIOD_MS ) ;           // Allow other tasks
-      if ( ( dpin < 0 ) && ( once == false ) )            // Just one check if no detect pin
-      {
-        continue ;
-      }
-      once = false ;                                      // Stop detect without detect pin
       if ( SDInsertCheck() )                              // See if new card is inserted
       {
         SD_lastmp3spec[0] = '\0' ;                        // No last track
