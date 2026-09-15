@@ -41,7 +41,7 @@
 // Wiring. Note that this is just an example.  Pins (except 18, 19 and 23 of the SPI interface)
 // can be configured in the config page of the web interface.
 //
-// ESP32dev Signal  Wired to LCD        Wired to VS1053      AI Audio board    Wired to the rest
+// ESP32dev Signal  Wired to LCD        Wired to VS1003/1053 AI Audio board    Wired to the rest
 // -------- ------  --------------      -------------------  ---------------   ------------------------
 // GPIO32           -                   pin 1 XDCS           I2C Clock
 // GPIO33           -                   -                    I2C Data
@@ -53,16 +53,19 @@
 // GPIO18   SCK     pin 5 CLK or SCK    pin 5 SCK            KEY 5             -
 // GPIO19   MISO    -                   pin 7 MISO           KEY 3             -
 // GPIO23   MOSI    pin 4 DIN or SDA    pin 6 MOSI           KEY 4             -
+// GPIO22           -                   -                                      SD card CS
 // GPIO15           pin 2 CS            -                    SPI_MOSI          -
 // GPIO3    RXD0    -                   -                                      Reserved serial input
 // GPIO1    TXD0    -                   -                                      Reserved serial output
 // GPIO34   -       -                   -                    SD detect         Optional pull-up resistor
 // GPIO35   -       -                   -                                      Infrared receiver VS1838B
-// GPIO25   -       -                   -                    I2S DSIN          Rotary encoder CLK
-// GPIO26   -       -                   -                    I2S LRC           Rotary encoder DT
-// GPIO27   -       -                   -                    I2S BCLK          Rotary encoder SW
-// GPIO13   -       -                   -                    SD card CS        -
-// GPIO14   -       -                   -                    SPI_SCK           -
+// GPIO25   -       -                   -                    I2S DSIN          -
+// GPIO26   -       -                   -                    I2S LRC           Rotary encoder CLK
+// GPIO27   -       -                   -                    I2S BCLK          Rotary encoder DT
+// GPIO13   -       -                   -                    -                 -
+// GPIO14   -       -                   -                    SPI_SCK           Rotary encoder SW
+// This VS1003 configuration uses rotary CLK/DT/SW on GPIO26/27/14.  These pins cannot be shared
+// with the alternative AI Audio I2S/SPI signals shown in the adjacent column.
 // GPIO36   -       -                   -                    KEY 1             -
 // GPIO13   -       -                   -                    KEY 2             -
 // GPIO19   -       -                   -                    KEY 3             -
@@ -114,7 +117,7 @@
 
 //
 // Define the version number, the format used is the HTTP standard.
-#define VERSION     "Mon, 14 Sep 2026 20:30:00 GMT"
+#define VERSION     "Tue, 15 Sep 2026 13:00:00 GMT"
 //
 #include <Arduino.h>                                      // Standard include for Platformio Arduino projects
 #include "soc/soc.h"                                      // For brown-out detector setting
@@ -430,6 +433,12 @@ sv bool           singleclick = false ;                  // True if single click
 sv bool           doubleclick = false ;                  // True if double click detected
 sv bool           tripleclick = false ;                  // True if triple click detected
 sv bool           longclick = false ;                    // True if longclick detected
+uint32_t          encoder_menu_activity_time = 0 ;       // Last activity while a list is open
+bool              enc_switch_raw = false ;               // Latest sampled SW level (true = pressed)
+bool              enc_switch_stable = false ;            // Debounced SW level
+bool              enc_switch_long_sent = false ;         // Long press was already reported
+uint32_t          enc_switch_change_time = 0 ;            // Last raw SW transition
+uint32_t          enc_switch_press_time = 0 ;             // Start of a stable press
 enum enc_menu_t { VOLUME, PRESET, TRACK } ;              // State for rotary encoder menu
 enc_menu_t        enc_menu_mode = VOLUME ;               // Default is VOLUME mode
 //
@@ -1224,14 +1233,56 @@ void IRAM_ATTR isr_enc_switch()
       if ( ( dtime ) > 2000 )                              // More than 2 second?
       {
         longclick = true ;                                 // Yes, register longclick
-        clickcount = 0 ;                                   // Forget normal count
       }
       else
       {
-        clickcount++ ;                                     // Yes, click detected
+        singleclick = true ;                               // Handle short click immediately on release
       }
+      clickcount = 0 ;                                     // Disable legacy delayed multi-click handling
       enc_inactivity = 0 ;                                 // Not inactive anymore
     }
+  }
+}
+
+//**************************************************************************************************
+//                              P O L L   E N C O D E R   S W I T C H                              *
+//**************************************************************************************************
+// Debounce the push switch outside the ISR.  A short electrical pulse must never leave the switch *
+// state stuck at "pressed" and turn a later rotary edge into a false click.                        *
+//**************************************************************************************************
+void pollEncoderSwitch()
+{
+  if ( ini_block.enc_sw_pin < 0 ) return ;
+
+  uint32_t now = millis() ;
+  bool raw = ( digitalRead ( ini_block.enc_sw_pin ) == LOW ) ;
+  if ( raw != enc_switch_raw )
+  {
+    enc_switch_raw = raw ;
+    enc_switch_change_time = now ;
+  }
+
+  if ( raw != enc_switch_stable && now - enc_switch_change_time >= 35 )
+  {
+    enc_switch_stable = raw ;
+    if ( raw )
+    {
+      enc_switch_press_time = now ;
+      enc_switch_long_sent = false ;
+    }
+    else
+    {
+      if ( !enc_switch_long_sent ) singleclick = true ;
+      enc_inactivity = 0 ;
+    }
+  }
+
+  if ( enc_switch_stable && !enc_switch_long_sent &&
+       now - enc_switch_press_time >= 2000 )
+  {
+    longclick = true ;
+    enc_switch_long_sent = true ;
+    enc_inactivity = 0 ;
   }
 }
 
@@ -2085,6 +2136,9 @@ static void restoreRadioView()
   station_list_active = false ;
   station_list_sd = false ;
   station_list_scroll_needed = false ;
+  enc_menu_mode = VOLUME ;                              // Normal rotation controls volume again
+  enc_inactivity = 0 ;
+  encoder_menu_activity_time = 0 ;
   if ( dsp_ok ) dsp_erase() ;
   displaytime ( "" ) ;
   #if defined(SDCARD) && defined(BLUETFT)
@@ -2256,6 +2310,9 @@ void openStationList()
   if ( !presetExists ( station_list_preset ) &&
        !findPreset ( 0, 1, 1, &station_list_preset ) ) return ;
   station_list_active = true ;
+  enc_menu_mode = VOLUME ;                              // List flag handles navigation, not legacy mode
+  enc_inactivity = 0 ;
+  encoder_menu_activity_time = millis() ;               // Full five seconds from opening the menu
   station_list_scroll = 0 ;
   station_list_scroll_time = millis() ;
   drawStationList() ;
@@ -2280,6 +2337,9 @@ void openSDList()
       station_list_sd_index = 0 ;
     }
     station_list_active = true ;
+    enc_menu_mode = VOLUME ;                            // List flag handles navigation, not legacy mode
+    enc_inactivity = 0 ;
+    encoder_menu_activity_time = millis() ;             // Full five seconds from opening the menu
     station_list_scroll = 0 ;
     station_list_scroll_time = millis() ;
     drawStationList() ;
@@ -2292,6 +2352,8 @@ void openSDList()
 void moveStationList ( int8_t direction, uint8_t count )
 {
   if ( !station_list_active || !direction || !count ) return ;
+  enc_inactivity = 0 ;
+  encoder_menu_activity_time = millis() ;               // Navigation restarts the exact timeout
   #ifdef SDCARD
     if ( station_list_sd )
     {
@@ -2470,11 +2532,11 @@ void readIOprefs()
   };
   struct iosetting klist[] = {                            // List of I/O related keys
       { "pin_ir",        &ini_block.ir_pin,           -1 },
-      { "pin_enc_clk",   &ini_block.enc_clk_pin,      -1 }, // Rotary encoder CLK
-      { "pin_enc_dt",    &ini_block.enc_dt_pin,       -1 }, // Rotary encoder DT
+      { "pin_enc_clk",   &ini_block.enc_clk_pin,      -1 }, // Config default: GPIO26 (CLK)
+      { "pin_enc_dt",    &ini_block.enc_dt_pin,       -1 }, // Config default: GPIO27 (DT)
       { "pin_enc_up",    &ini_block.enc_up_pin,       -1 }, // ZIPPY B5 side switch up
       { "pin_enc_dwn",   &ini_block.enc_dwn_pin,      -1 }, // ZIPPY B5 side switch down
-      { "pin_enc_sw",    &ini_block.enc_sw_pin,       -1 },
+      { "pin_enc_sw",    &ini_block.enc_sw_pin,       -1 }, // Config default: GPIO14 (SW)
       { "pin_tft_cs",    &ini_block.tft_cs_pin,       -1 }, // Display SPI version
       { "pin_tft_dc",    &ini_block.tft_dc_pin,       -1 }, // Display SPI version
       { "pin_tft_scl",   &ini_block.tft_scl_pin,      -1 }, // Display I2C version
@@ -2483,12 +2545,12 @@ void readIOprefs()
       { "pin_tft_blx",   &ini_block.tft_blx_pin,      -1 }, // Display backlight (inversed logic)
       { "pin_nxt_rx",    &ini_block.nxt_rx_pin,       -1 }, // NEXTION input pin
       { "pin_nxt_tx",    &ini_block.nxt_tx_pin,       -1 }, // NEXTION output pin
-      { "pin_sd_cs",     &ini_block.sd_cs_pin,        -1 }, // SD card select
+      { "pin_sd_cs",     &ini_block.sd_cs_pin,        -1 }, // Config default: GPIO22
       { "pin_sd_detect", &ini_block.sd_detect_pin,    -1 }, // SD card detect
     #if defined(DEC_VS1053) || defined(DEC_VS1003)
-      { "pin_vs_cs",     &ini_block.vs_cs_pin,        -1 }, // VS1053 pins
-      { "pin_vs_dcs",    &ini_block.vs_dcs_pin,       -1 },
-      { "pin_vs_dreq",   &ini_block.vs_dreq_pin,      -1 },
+      { "pin_vs_cs",     &ini_block.vs_cs_pin,        -1 }, // Config default: GPIO5
+      { "pin_vs_dcs",    &ini_block.vs_dcs_pin,       -1 }, // Config default: GPIO32
+      { "pin_vs_dreq",   &ini_block.vs_dreq_pin,      -1 }, // Config default: GPIO4
     #endif
       { "pin_shutdown",  &ini_block.shutdown_pin,     -1 }, // Amplifier shut-down pin
       { "pin_shutdownx", &ini_block.shutdownx_pin,    -1 }, // Amplifier shut-down pin (inversed logic)
@@ -2964,12 +3026,12 @@ static bool migrateSDConfigToPreferences()
   }
   if ( !nvssearch ( "pin_sd_cs" ) )
   {
-    nvssetstr ( "pin_sd_cs", String ( "21" ) ) ;        // Shared SPI, dedicated chip-select
+    nvssetstr ( "pin_sd_cs", String ( "22" ) ) ;        // Shared SPI, dedicated chip-select
     changed = true ;
   }
   nvs_set_u8 ( nvshandle, "sd_cfg_ver", SD_CONFIG_VERSION ) ;
   nvs_commit ( nvshandle ) ;
-  ESP_LOGI ( TAG, "SD configuration migrated: shared SPI, CS GPIO21" ) ;
+  ESP_LOGI ( TAG, "SD configuration migrated: shared SPI, CS GPIO22" ) ;
   return changed ;
 }
 #endif
@@ -3318,7 +3380,7 @@ void setup()
   ESP_LOGI ( TAG, "Version %s.  Free memory %d",
              VERSION,
              heapspace ) ;                                // Normally about 100 kB
-  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V21-20260914" ) ; // MP3 L/R tracks and larger counter
+  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V26-20260915" ) ; // Pin information matches installed hardware
   ESP_LOGI ( TAG, "Display type is %s", DISPLAYTYPE ) ;   // Report display option
   
   if ( !SPIFFS.begin ( FSIF ) )                           // Mount and test SPIFFS
@@ -3542,9 +3604,15 @@ void setup()
   #ifdef ZIPPYB5
     if ( ( ini_block.enc_up_pin + ini_block.enc_dwn_pin + ini_block.enc_sw_pin ) > 2 )
     {
+      pinMode ( ini_block.enc_up_pin,  INPUT_PULLUP ) ;
+      pinMode ( ini_block.enc_dwn_pin, INPUT_PULLUP ) ;
+      pinMode ( ini_block.enc_sw_pin,  INPUT_PULLUP ) ;
+      enc_switch_raw = enc_switch_stable =
+        ( digitalRead ( ini_block.enc_sw_pin ) == LOW ) ;
+      enc_switch_change_time = millis() ;
+      if ( enc_switch_stable ) enc_switch_press_time = enc_switch_change_time ;
       attachInterrupt ( ini_block.enc_up_pin,  isr_enc_turn,   CHANGE ) ;
       attachInterrupt ( ini_block.enc_dwn_pin, isr_enc_turn,   CHANGE ) ;
-      attachInterrupt ( ini_block.enc_sw_pin,  isr_enc_switch, CHANGE ) ;
       ESP_LOGI ( TAG, "ZIPPY side switch is enabled" ) ;
     }
     else
@@ -3557,10 +3625,17 @@ void setup()
   #else
     if ( ( ini_block.enc_clk_pin + ini_block.enc_dt_pin + ini_block.enc_sw_pin ) > 2 )
     {
+      pinMode ( ini_block.enc_clk_pin, INPUT_PULLUP ) ;
+      pinMode ( ini_block.enc_dt_pin,  INPUT_PULLUP ) ;
+      pinMode ( ini_block.enc_sw_pin,  INPUT_PULLUP ) ;
+      enc_switch_raw = enc_switch_stable =
+        ( digitalRead ( ini_block.enc_sw_pin ) == LOW ) ;
+      enc_switch_change_time = millis() ;
+      if ( enc_switch_stable ) enc_switch_press_time = enc_switch_change_time ;
       attachInterrupt ( ini_block.enc_clk_pin, isr_enc_turn,   CHANGE ) ;
       attachInterrupt ( ini_block.enc_dt_pin,  isr_enc_turn,   CHANGE ) ;
-      attachInterrupt ( ini_block.enc_sw_pin,  isr_enc_switch, CHANGE ) ;
-      ESP_LOGI ( TAG, "Rotary encoder is enabled" ) ;
+      ESP_LOGI ( TAG, "Rotary encoder is enabled (%d/%d/%d), SW uses 35 ms debounce",
+                 ini_block.enc_clk_pin, ini_block.enc_dt_pin, ini_block.enc_sw_pin ) ;
     }
     else
     {
@@ -3932,6 +4007,76 @@ void handleVolPub()
 //**************************************************************************************************
 void chk_enc()
 {
+  pollEncoderSwitch() ;                                      // SW is filtered separately from rotation
+
+  if ( station_list_active && encoder_menu_activity_time &&
+       millis() - encoder_menu_activity_time >= 5000 )        // Five seconds from last activity?
+  {
+    singleclick = doubleclick = tripleclick = longclick = false ;
+    rotationcount = 0 ;
+    restoreRadioView() ;                                      // Return to current radio/MP3 screen
+    ESP_LOGI ( TAG, "Encoder menu closed after 5 seconds inactivity" ) ;
+    return ;
+  }
+
+  if ( !singleclick && !doubleclick && !tripleclick &&
+       !longclick && rotationcount == 0 ) return ;             // Nothing to handle
+
+  blset ( true ) ;                                             // Encoder activity wakes the display
+  if ( station_list_active ) encoder_menu_activity_time = millis() ;
+
+  if ( longclick )                                             // Long press always opens the MP3 list
+  {
+    singleclick = doubleclick = tripleclick = longclick = false ;
+    rotationcount = 0 ;
+    ESP_LOGI ( TAG, "Long click: open MP3 menu" ) ;
+    openSDList() ;
+    return ;
+  }
+
+  if ( station_list_active )                                  // Both lists use the same controls
+  {
+    if ( singleclick || doubleclick || tripleclick )           // Click confirms highlighted row
+    {
+      singleclick = doubleclick = tripleclick = false ;
+      rotationcount = 0 ;
+      confirmStationList() ;
+      return ;
+    }
+    if ( rotationcount )                                      // Turning scrolls highlighted row
+    {
+      int16_t movement = rotationcount ;
+      rotationcount = 0 ;
+      moveStationList ( movement > 0 ? 1 : -1,
+                        movement > 0 ? movement : -movement ) ;
+    }
+    return ;
+  }
+
+  if ( singleclick || doubleclick || tripleclick )             // Short click opens station list
+  {
+    singleclick = doubleclick = tripleclick = false ;
+    rotationcount = 0 ;
+    ESP_LOGI ( TAG, "Short click: open station menu" ) ;
+    openStationList() ;
+    return ;
+  }
+
+  int16_t volumeStep = rotationcount * 4 ;                     // Normal turning adjusts volume
+  rotationcount = 0 ;
+  if ( !muteflag )
+  {
+    int16_t newVolume = ini_block.reqvol + volumeStep ;
+    ini_block.reqvol = constrain ( newVolume, 0, 100 ) ;
+    ESP_LOGI ( TAG, "Encoder volume is %d", ini_block.reqvol ) ;
+  }
+}
+
+
+#if 0
+// Superseded encoder overlay behavior, excluded from V22.
+static void chk_enc_legacy()
+{
   static int16_t enc_preset ;                                 // Selected preset
   String         tmp, tmp2 ;                                  // Temporary strings
 
@@ -4113,6 +4258,7 @@ void chk_enc()
   }
   rotationcount = 0 ;                                         // Reset
 }
+#endif
 
 
 //**************************************************************************************************

@@ -90,21 +90,21 @@ ir_42BD = sdlist                                    # Open SD track list
 #
 # GPIO pinnings
 pin_ir = 35                                          # GPIO Pin number for IR receiver VS1838B
-pin_enc_clk = 12                                     # GPIO Pin number for rotary encoder "CLK"
-pin_enc_dt = 14                                      # GPIO Pin number for rotary encoder "DT"
-pin_enc_sw = 13                                      # GPIO Pin number for rotary encoder "SW"
+pin_enc_clk = 26                                     # GPIO Pin number for rotary encoder "CLK"
+pin_enc_dt = 27                                      # GPIO Pin number for rotary encoder "DT"
+pin_enc_sw = 14                                      # GPIO Pin number for rotary encoder "SW"
 #
 pin_tft_cs = 15                                       # GPIO Pin number for TFT "CS"
 pin_tft_dc = 2                                       # GPIO Pin number for TFT "DC"
 #
-# SD card shares SCK/MISO/MOSI with the display and VS1053
-pin_sd_cs = 21                                        # GPIO Pin number for SD card CS
+# SD card shares SCK/MISO/MOSI with the display and VS1003/VS1053
+pin_sd_cs = 22                                        # GPIO Pin number for SD card "CS"
 #pin_sd_detect = -1                                   # Optional card-detect pin; disabled
 #
-# define pins for decoder.  Example for VS1053
-pin_vs_cs = 5                                        # GPIO Pin number for VS1053 "CS"
-pin_vs_dcs = 32                                      # GPIO Pin number for VS1053 "DCS"
-pin_vs_dreq = 4                                     # GPIO Pin number for VS1053 "DREQ"
+# define pins for the VS1003/VS1053 decoder
+pin_vs_cs = 5                                        # GPIO Pin number for decoder "CS"
+pin_vs_dcs = 32                                      # GPIO Pin number for decoder "DCS"
+pin_vs_dreq = 4                                      # GPIO Pin number for decoder "DREQ"
 #
 # define pins for decoder.  Example for I2S, like PCM5102
 #pin_i2s_bck = 15                                    # GPIO Pin number for I2S "BCK"

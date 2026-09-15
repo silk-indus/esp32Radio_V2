@@ -68,18 +68,18 @@ void setup()
   preferences.putString ( "ir_40BF",     "upvolume = 2" ) ;
   preferences.putString ( "ir_C03F",     "downvolume = 2" ) ;
   //
-  preferences.putString ( "pin_vs_cs",   "5                                      # GPIO Pin number for VS1053 CS" ) ;
-  preferences.putString ( "pin_vs_dcs",  "16                                     # GPIO Pin number for VS1053 DCS" ) ;
-  preferences.putString ( "pin_vs_dreq", "4                                      # GPIO Pin number for VS1053 DREQ" ) ;
+  preferences.putString ( "pin_vs_cs",   "5                                      # GPIO Pin number for VS1003/VS1053 CS" ) ;
+  preferences.putString ( "pin_vs_dcs",  "32                                     # GPIO Pin number for VS1003/VS1053 DCS" ) ;
+  preferences.putString ( "pin_vs_dreq", "4                                      # GPIO Pin number for VS1003/VS1053 DREQ" ) ;
   //
-  preferences.putString ( "pin_enc_clk", "25                                     # GPIO Pin number for rotary encoder CLK" ) ;
-  preferences.putString ( "pin_enc_dt",  "26                                     # GPIO Pin number for rotary encoder DT" ) ;
-  preferences.putString ( "pin_enc_sw",  "27                                     # GPIO Pin number for rotary encoder SW" ) ;
+  preferences.putString ( "pin_enc_clk", "26                                     # GPIO Pin number for rotary encoder CLK" ) ;
+  preferences.putString ( "pin_enc_dt",  "27                                     # GPIO Pin number for rotary encoder DT" ) ;
+  preferences.putString ( "pin_enc_sw",  "14                                     # GPIO Pin number for rotary encoder SW" ) ;
   //
   preferences.putString ( "pin_tft_cs",  "15                                     # GPIO Pin number for TFT CS" ) ;
   preferences.putString ( "pin_tft_dc",  "2                                      # GPIO Pin number for TFT DC" ) ;
   //
-  preferences.putString ( "pin_sd_cs",   "21                                     # GPIO Pin number for SD card CS" ) ;
+  preferences.putString ( "pin_sd_cs",   "22                                     # GPIO Pin number for SD card CS" ) ;
 
   preferences.end() ;
   delay ( 1000 ) ;

@@ -1,6 +1,7 @@
 //**************************************************************************************************
 // VS1053 class implementation.                                                                    *
 //**************************************************************************************************
+#include "config.h"                                  // Make DEC_VS1003 visible in this library unit
 #include "VS1053.h"
 
 VS1053*     vs1053player ;                          // The object for the MP3 player
