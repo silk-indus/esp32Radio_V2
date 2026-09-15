@@ -52,8 +52,11 @@ uint16_t VS1053::read_register ( uint8_t _reg ) const
   // Note: transfer16 does not seem to work
   result = ( SPI.transfer ( 0xFF ) << 8 ) |         // Read 16 bits data
            ( SPI.transfer ( 0xFF ) ) ;
-  await_data_request() ;                            // Wait for DREQ to be HIGH again
-  control_mode_off() ;                              // End control_mode transaction
+  control_mode_off() ;                              // XCS HIGH ends SCI command before DREQ wait
+  if ( !await_data_request() )                       // Wait for DREQ to be HIGH again
+  {
+    ESP_LOGE ( VTAG, "DREQ timeout after SCI read" ) ;
+  }
   return result ;
 }
 
@@ -63,8 +66,11 @@ void VS1053::write_register ( uint8_t _reg, uint16_t _value ) const
   SPI.write ( 2 ) ;                                 // Write operation
   SPI.write ( _reg ) ;                              // Register to write (0..0xF)
   SPI.write16 ( _value ) ;                          // Send 16 bits data
-  await_data_request() ;
-  control_mode_off() ;                              // End control_mode transaction
+  control_mode_off() ;                              // Release XCS/SPI before chip processes command
+  if ( !await_data_request() )
+  {
+    ESP_LOGE ( VTAG, "DREQ timeout after SCI write" ) ;
+  }
 }
 
 bool VS1053::sdi_send_buffer ( uint8_t* data, size_t len )
@@ -79,20 +85,28 @@ bool VS1053::sdi_send_buffer ( uint8_t* data, size_t len )
       chunk_length = vs1053_chunk_size ;
     }
     len -= chunk_length ;
-    await_data_request() ;                          // Wait for space available
+    if ( !await_data_request() )                    // Wait for space available
+    {
+      ESP_LOGE ( VTAG, "DREQ timeout before audio data" ) ;
+      return false ;
+    }
     data_mode_on() ;                                // Start data-mode transaction
     SPI.writeBytes ( data, chunk_length ) ;
     data_mode_off() ;                               // End data-mode transaction
     data += chunk_length ;
   }
-  return data_request() ;                           // True if more data can be stored in fifo
+  return true ;                                     // All bytes were accepted; DREQ may go LOW normally
 }
 
-void VS1053::sdi_send_fillers ( uint8_t numchunks )
+bool VS1053::sdi_send_fillers ( uint8_t numchunks )
 {
   while ( numchunks-- )                             // More to do?
   {
-    await_data_request() ;                          // Wait for space available
+    if ( !await_data_request() )                    // Wait for space available
+    {
+      ESP_LOGE ( VTAG, "DREQ timeout before filler data" ) ;
+      return false ;
+    }
     data_mode_on() ;                                // Start data-mode transaction
     for ( uint8_t i = 0 ; i < vs1053_chunk_size ; i++ )
     {
@@ -100,6 +114,7 @@ void VS1053::sdi_send_fillers ( uint8_t numchunks )
     }
     data_mode_off() ;                               // End data-mode transaction
   }
+  return true ;
 }
 
 void VS1053::wram_write ( uint16_t address, uint16_t data )
@@ -120,9 +135,8 @@ bool VS1053::testComm ( const char *header )
   // If DREQ is low, there is problably no VS1053 connected.  Pull the line HIGH
   // in order to prevent an endless loop waiting for this signal.  The rest of the
   // software will still work, but readbacks from VS1053 will fail.
-  int            i ;                                    // Loop control
   uint16_t       r1, r2, cnt = 0 ;
-  uint16_t       delta = 300 ;                          // 3 for fast SPI
+  const uint16_t patterns[] = { 0x0000, 0x2424, 0x5A5A, 0xA5A5, 0x7878 } ;
   const uint16_t vstype[] = { 1001, 1011, 1002, 1003,   // Possible chip versions
                               1053, 1033, 0000, 1103 } ;
   
@@ -136,12 +150,9 @@ bool VS1053::testComm ( const char *header )
   // We will use the volume setting for this.
   // Will give warnings on serial output if DEBUG is active.
   // A maximum of 20 errors will be reported.
-  if ( strstr ( header, "Fast" ) )
+  for ( uint8_t p = 0 ; p < sizeof(patterns) / sizeof(patterns[0]) ; p++ )
   {
-    delta = 3 ;                                         // Fast SPI, more loops
-  }
-  for ( i = 0 ; ( i < 0xFFFF ) && ( cnt < 20 ) ; i += delta )
-  {
+    uint16_t i = patterns[p] ;                           // A short deterministic bus test is enough
     write_register ( SCI_VOL, i ) ;                     // Write data to SCI_VOL
     r1 = read_register ( SCI_VOL ) ;                    // Read back for the first time
     r2 = read_register ( SCI_VOL ) ;                    // Read back a second time
@@ -149,24 +160,30 @@ bool VS1053::testComm ( const char *header )
     {
       ESP_LOGE ( VTAG, "SPI error. SB:%04X R1:%04X R2:%04X", i, r1, r2 ) ;
       cnt++ ;
-      delay ( 10 ) ;
+      break ;
     }
   }
   okay = ( cnt == 0 ) ;                                 // True if working correctly
   // Further testing: is it the right chip?
   r1 = ( read_register ( SCI_STATUS ) >> 4 ) & 0x7 ;    // Read status to get the version
-  if ( r1 !=  4 )                                       // Version 4 is a genuine VS1053
+  #ifdef DEC_VS1003
+    const uint8_t expectedVersion = 3 ;                  // VS1003 reports SCI_STATUS version 3
+  #else
+    const uint8_t expectedVersion = 4 ;                  // VS1053 reports SCI_STATUS version 4
+  #endif
+  if ( r1 != expectedVersion )
   {
-    ESP_LOGW ( VTAG, "This is not a VS1053, "           // Report the wrong chip
-               "but a VS%d instead!",
-               vstype[r1] ) ;
+    ESP_LOGW ( VTAG, "Unexpected decoder: expected VS%d, detected VS%d",
+               vstype[expectedVersion], vstype[r1] ) ;
     //okay = false ;                                    // Standard codecs not fully supported
   }
   return ( okay ) ;                                     // Return the result
 }
 
-void VS1053::begin()
+bool VS1053::begin()
 {
+  okay = false ;
+  curvol = 0xFF ;                                       // First real volume request must reach the chip
   pinMode      ( dreq_pin,  INPUT_PULLUP ) ;            // DREQ is an input
   pinMode      ( cs_pin,    OUTPUT ) ;                  // The SCI and SDI signals
   pinMode      ( dcs_pin,   OUTPUT ) ;
@@ -188,7 +205,7 @@ void VS1053::begin()
   VS1053_SPI._dataMode = SPI_MODE0 ;
   delay ( 20 ) ;
   //printDetails ( "20 msec after reset" ) ;
-  if ( testComm ( "Slow SPI, Testing VS1053 read/write registers..." ) )
+  if ( testComm ( "Slow SPI, testing VS1003 read/write registers..." ) )
   {
     // Most VS1053 modules will start up in midi mode.  The result is that there is no audio
     // when playing MP3.  You can modify the board, but there is a more elegant way:
@@ -199,17 +216,39 @@ void VS1053::begin()
     softReset() ;                                         // Do a soft reset
     // Switch on the analog parts
     write_register ( SCI_AUDATA, 44100 + 1 ) ;            // 44.1kHz + stereo
-    // The next clocksetting allows SPI clocking at 5 MHz, 4 MHz is safe then.
-    write_register ( SCI_CLOCKF, 6 << 12 ) ;              // Normal clock settings
-    // multiplyer 3.0 = 12.2 MHz
-    VS1053_SPI._clock = 5000000 ;                         // SPI Clock to 5 MHz.
+    // VS1003 datasheet-recommended 3.0x clock with allowed temporary multiplier addition.
+    write_register ( SCI_CLOCKF, 0x9800 ) ;
+    VS1053_SPI._clock = 2000000 ;                         // Conservative shared-bus clock for VS1003
     write_register ( SCI_MODE, _BV ( SM_SDINEW ) | _BV ( SM_LINE1 ) ) ;
-    testComm ( "Fast SPI, Testing VS1053 read/write registers again..." ) ;
+    if ( !testComm ( "Normal SPI, testing VS1003 registers again..." ) )
+    {
+      ESP_LOGE ( VTAG, "VS1003 communication test failed" ) ;
+      return false ;
+    }
     delay ( 10 ) ;
-    await_data_request() ;
-    endFillByte = wram_read ( 0x1E06 ) & 0xFF ;
+    if ( !await_data_request() )
+    {
+      ESP_LOGE ( VTAG, "DREQ timeout after VS1003 initialization" ) ;
+      return false ;
+    }
+    #ifdef DEC_VS1003
+      endFillByte = 0 ;                                  // VS1003 has no VS1053 end-fill-byte register
+    #else
+      endFillByte = wram_read ( 0x1E06 ) & 0xFF ;
+    #endif
+    write_register ( SCI_VOL, 0xF8F8 ) ;                 // Test must not leave volume at its last pattern
+    curvol = 0xFF ;                                      // Force QSTARTSONG to set requested volume
+    okay = true ;
+    const uint16_t mode = read_register ( SCI_MODE ) ;
+    const uint16_t clockf = read_register ( SCI_CLOCKF ) ;
+    const uint16_t status = read_register ( SCI_STATUS ) ;
+    ESP_LOGI ( VTAG, "VS1003 ready: MODE=%04X CLOCKF=%04X STATUS=%04X",
+               mode, clockf, status ) ;
     delay ( 100 ) ;
+    return true ;
   }
+  ESP_LOGE ( VTAG, "VS1003 slow SPI communication test failed" ) ;
+  return false ;
 }
 
 void VS1053::setVolume ( uint8_t vol )
@@ -258,7 +297,9 @@ void VS1053::setTone ( uint8_t *rtone )                 // Set bass/treble (4 ni
 
 void VS1053::startSong()
 {
-  sdi_send_fillers ( 60 ) ;
+  #ifndef DEC_VS1003
+    if ( !sdi_send_fillers ( 8 ) ) return ;             // VS1053 clean pre-roll
+  #endif
   output_enable ( true ) ;                              // Enable amplifier through shutdown pin(s)
 }
 
@@ -269,33 +310,54 @@ bool VS1053::playChunk ( uint8_t* data, size_t len )
 
 void VS1053::stopSong()
 {
+  #ifdef DEC_VS1003
+    output_enable ( false ) ;                            // VS1003 has no SM_CANCEL command
+    softReset() ;                                        // End the current MP3 stream deterministically
+    write_register ( SCI_AUDATA, 44100 + 1 ) ;
+    write_register ( SCI_CLOCKF, 0x9800 ) ;
+    write_register ( SCI_MODE, _BV ( SM_SDINEW ) | _BV ( SM_LINE1 ) ) ;
+    curvol = 0xFF ;                                      // Force volume write for the next stream
+    return ;
+  #else
   uint16_t modereg ;                                    // Read from mode register
   int      i ;                                          // Loop control
 
-  sdi_send_fillers ( 60 ) ;                             // Send 60 * 32 fillers
+  if ( !sdi_send_fillers ( 8 ) )                        // Do not hang on a failed decoder
+  {
+    output_enable ( false ) ;
+    return ;
+  }
   output_enable ( false ) ;                             // Disable amplifier through shutdown pin(s)
   delay ( 10 ) ;
   write_register ( SCI_MODE, _BV ( SM_SDINEW ) | _BV ( SM_CANCEL ) ) ;
   for ( i = 0 ; i < 20 ; i++ )
   {
-    sdi_send_fillers ( 1 ) ;                            // Send 32 fillers
+    if ( !sdi_send_fillers ( 1 ) ) break ;              // Send 32 fillers
     modereg = read_register ( SCI_MODE ) ;              // Read mode status
     if ( ( modereg & _BV ( SM_CANCEL ) ) == 0 )         // SM_CANCEL will be cleared when finished
     {
-      sdi_send_fillers ( 60 ) ;
+      sdi_send_fillers ( 8 ) ;
       ESP_LOGI ( VTAG, "Song stopped correctly after %d msec", i * 10 ) ;
       return ;
     }
     delay ( 10 ) ;
   }
   //printDetails ( "Song stopped incorrectly!" ) ;
+  #endif
 }
 
 void VS1053::softReset()
 {
   write_register ( SCI_MODE, _BV ( SM_SDINEW ) | _BV ( SM_RESET ) ) ;
   delay ( 10 ) ;
-  await_data_request() ;
+  if ( !await_data_request() ) ESP_LOGE ( VTAG, "DREQ timeout after soft reset" ) ;
+}
+
+
+bool VS1053::recover()
+{
+  ESP_LOGW ( VTAG, "Reinitializing VS1003 after playback failure" ) ;
+  return begin() ;
 }
 
 // void VS1053::printDetails ( const char *header )
@@ -353,7 +415,7 @@ void VS1053::streamMode ( bool onoff )                // Set stream mode on/off
   }
   write_register ( SCI_MODE, pat ) ;                  // Set new value
   delay ( 10 ) ;
-  await_data_request() ;
+  if ( !await_data_request() ) ESP_LOGE ( VTAG, "DREQ timeout in streamMode" ) ;
 }
 
 bool VS1053_begin ( int8_t cs, int8_t dcs, int8_t dreq, int8_t shutdown, int8_t shutdownx )
@@ -364,11 +426,5 @@ bool VS1053_begin ( int8_t cs, int8_t dcs, int8_t dreq, int8_t shutdown, int8_t 
   //}
   vs1053player = new VS1053 ( cs, dcs, dreq,          // Create object
                               shutdown, shutdownx ) ;
-  if ( ! vs1053player->data_request() )               // DREC should be high
-  {
-    return false ;
-  }
-  vs1053player->streamMode ( true ) ;                 // Set streammode (experimental)
-  vs1053player->begin() ;                             // Initialize VS1053 player
-  return true ;
+  return vs1053player->begin() ;                      // Initialize pins before any SPI/DREQ access
 }

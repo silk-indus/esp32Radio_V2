@@ -25,7 +25,7 @@ class VS1053
     int8_t        dreq_pin ;                       // Pin where DREQ line is connected
     int8_t        shutdown_pin ;                   // Pin where the shutdown line is connected
     int8_t        shutdownx_pin ;                  // Pin where the shutdown (inversed) line is connected
-    uint8_t       curvol ;                         // Current volume setting 0..100%
+    uint8_t       curvol = 0xFF ;                  // Force first setVolume() to program hardware
     const uint8_t vs1053_chunk_size = 32 ;
     // SCI Register
     const uint8_t SCI_MODE          = 0x0 ;
@@ -51,12 +51,15 @@ class VS1053
     uint8_t       endFillByte ;                   // Byte to send when stopping song
     bool          okay              = true ;      // VS1053 is working
   protected:
-    inline void await_data_request() const
+    inline bool await_data_request ( uint32_t timeout = 750 ) const
     {
+      uint32_t start = millis() ;
       while ( !digitalRead ( dreq_pin ) )
       {
-        NOP() ;                                   // Very short delay
+        if ( millis() - start >= timeout ) return false ;
+        vTaskDelay ( 1 ) ;                        // Let IDLE0 run while the decoder is busy
       }
+      return true ;
     }
     void        control_mode_on() const ;
     void        control_mode_off() const ;
@@ -65,7 +68,7 @@ class VS1053
     uint16_t    read_register ( uint8_t _reg ) const ;
     void        write_register ( uint8_t _reg, uint16_t _value ) const ;
     inline bool sdi_send_buffer ( uint8_t* data, size_t len ) ;
-    void        sdi_send_fillers ( uint8_t numchunks ) ;
+    bool        sdi_send_fillers ( uint8_t numchunks ) ;
     void        wram_write ( uint16_t address, uint16_t data ) ;
     uint16_t    wram_read ( uint16_t address ) ;
     void        output_enable ( bool ena ) ;             // Enable amplifier through shutdown pin(s)
@@ -74,7 +77,7 @@ class VS1053
     // Constructor.  Only sets pin values.  Doesn't touch the chip.  Be sure to call begin()!
     VS1053 ( int8_t _cs_pin, int8_t _dcs_pin, int8_t _dreq_pin,
              int8_t _shutdown_pin, int8_t _shutdownx_pin ) ;
-    void     begin() ;                                   // Begin operation.  Sets pins correctly,
+    bool     begin() ;                                   // Begin operation.  Sets pins correctly,
                                                          // and prepares SPI bus.
     void     startSong() ;                               // Prepare to start playing. Call this each
     // time a new song starts.
@@ -95,6 +98,7 @@ class VS1053
     //void   printDetails ( const char *header ) ;       // Print config details to serial output
     void     softReset() ;                               // Do a soft reset
     bool     testComm ( const char *header ) ;           // Test communication with module
+    bool     recover() ;                                 // Reinitialize after DREQ/SPI failure
     inline bool data_request() const
     {
       return ( digitalRead ( dreq_pin ) == HIGH ) ;

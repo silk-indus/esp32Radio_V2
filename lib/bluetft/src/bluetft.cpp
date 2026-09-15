@@ -98,6 +98,33 @@ namespace
         return width ;
       }
 
+      void drawSingleLine ( Adafruit_ST7735& tft, const char* text,
+                            int16_t left, int16_t top, uint16_t maxWidth,
+                            uint16_t color, uint16_t background ) const
+      {
+        if ( !ready() || !text || !maxWidth ) return ;
+        File file = SPIFFS.open ( path, FILE_READ ) ;
+        if ( !file ) return ;
+        int16_t x = left ;
+        const int16_t right = left + maxWidth ;
+        const char* p = text ;
+        tft.startWrite() ;
+        while ( *p )
+        {
+          uint16_t cp = nextCodepoint ( p ) ;
+          if ( cp == '\r' ) continue ;
+          if ( cp == '\n' ) break ;
+          const SmoothGlyph* glyph = find ( cp ) ;
+          if ( !glyph && cp != ' ' ) glyph = find ( '?' ) ;
+          uint8_t advance = glyph ? glyph->advance : spaceWidth() ;
+          if ( x + advance > right ) break ;            // Clip by character, never by whole word
+          if ( glyph ) drawGlyph ( tft, file, *glyph, x, top, color, background ) ;
+          x += advance ;
+        }
+        tft.endWrite() ;
+        file.close() ;
+      }
+
       uint16_t requiredLines ( const char* text, uint16_t maxWidth ) const
       {
         if ( !text || !*text || !maxWidth ) return 0 ;
@@ -382,7 +409,6 @@ void bluetft_displaybattery ( uint16_t bat0, uint16_t bat100, uint16_t adcval )
   {
     if ( bat0 < bat100 )                                  // Levels set in preferences?
     {
-      static uint16_t oldpos = 0 ;                        // Previous charge level
       uint16_t        ypos ;                              // Position on screen
       uint16_t        v ;                                 // Constrainted ADC value
       uint16_t        newpos ;                            // Current setting
@@ -390,15 +416,11 @@ void bluetft_displaybattery ( uint16_t bat0, uint16_t bat100, uint16_t adcval )
       v = constrain ( adcval, bat0, bat100 ) ;            // Prevent out of scale
       newpos = map ( v, bat0, bat100, 0,                  // Compute length of green bar
                      dsp_getwidth() ) ;
-      if ( newpos != oldpos )                             // Value changed?
-      {
-        oldpos = newpos ;                                 // Remember for next compare
-        ypos = bluetft_tftdata[1].y - 5 ;                 // Just before 1st divider
-        dsp_fillRect ( 0, ypos, newpos, 2, GREEN ) ;      // Paint green part
-        dsp_fillRect ( newpos, ypos,
-                       dsp_getwidth() - newpos,
-                       2, RED ) ;                          // Paint red part
-      }
+      ypos = bluetft_tftdata[1].y - 2 ;                   // Gap directly above artist/title
+      dsp_fillRect ( 0, ypos, newpos, 2, GREEN ) ;        // Paint green part
+      dsp_fillRect ( newpos, ypos,
+                     dsp_getwidth() - newpos,
+                     2, RED ) ;                            // Paint red part
     }
   }
 }
@@ -414,18 +436,14 @@ void bluetft_displayvolume ( uint8_t vol )
 {
   if ( bluetft_tft )
   {
-    static uint8_t oldvol = 0 ;                         // Previous volume
     uint16_t       pos ;                                // Positon of volume indicator
 
-    if ( vol != oldvol )                                // Volume changed?
-    {
-      oldvol = vol ;                                    // Remember for next compare
-      pos = map ( vol, 0, 100, 0, dsp_getwidth() ) ;    // Compute position on TFT
-      dsp_fillRect ( 0, dsp_getheight() - 2,
-                     pos, 2, RED ) ;                    // Paint red part
-      dsp_fillRect ( pos, dsp_getheight() - 2,
-                     dsp_getwidth() - pos, 2, GREEN ) ; // Paint green part
-    }
+    // Redraw every second.  Text/menu refreshes may erase this row even when volume is unchanged.
+    pos = map ( vol, 0, 100, 0, dsp_getwidth() ) ;      // Compute position on TFT
+    dsp_fillRect ( 0, dsp_getheight() - 2,
+                   pos, 2, RED ) ;                      // Paint red part
+    dsp_fillRect ( pos, dsp_getheight() - 2,
+                   dsp_getwidth() - pos, 2, GREEN ) ;   // Paint green part
   }
 }
 
@@ -450,23 +468,104 @@ void bluetft_displaytime ( const char* str, uint16_t color )
   }
   if ( bluetft_tft )                               // TFT active?
   {
-    if ( strncmp ( str, oldstr, 8 ) != 0 )
+    if ( fontArialBold11.ready() )
+    {
+      int16_t x = pos ;
+      for ( uint8_t i = 0 ; i < 8 && str[i] ; i++ )
+      {
+        char character[2] = { str[i], '\0' } ;
+        uint16_t width = fontArialBold11.textWidth ( character ) ;
+        if ( str[i] != oldstr[i] )
+        {
+          dsp_fillRect ( x, 0, width, 14, BLACK ) ;       // Clear only changed digit/cell
+          fontArialBold11.drawSingleLine ( *bluetft_tft, character,
+                                            x, 0, width, color, BLACK ) ;
+          oldstr[i] = str[i] ;
+        }
+        x += width ;
+      }
+      oldstr[8] = '\0' ;
+    }
+    else if ( strncmp ( str, oldstr, 8 ) != 0 )
     {
       dsp_fillRect ( pos, 0, -TIMEPOS, 14, BLACK ) ;
-      if ( fontArialBold11.ready() )
-      {
-        fontArialBold11.draw ( *bluetft_tft, str, pos, 0, -TIMEPOS, 14, color ) ;
-      }
-      else
-      {
-        dsp_setTextColor ( color ) ;
-        dsp_setCursor ( pos, 0 ) ;
-        dsp_print ( str ) ;
-      }
+      dsp_setTextColor ( color ) ;
+      dsp_setCursor ( pos, 0 ) ;
+      dsp_print ( str ) ;
       strncpy ( oldstr, str, 8 ) ;
       oldstr[8] = '\0' ;
     }
   }
+}
+
+
+//**************************************************************************************************
+//                              D I S P L A Y   P L A Y   T I M E                                 *
+//**************************************************************************************************
+// Show SD played/length in the top-left field.  Redraw only changed digits when their widths stay *
+// equal; a minute digit rollover causes one full field redraw to keep character positions correct. *
+//**************************************************************************************************
+void bluetft_displayplaytime ( const char* str, uint16_t color )
+{
+  static String oldstr = "" ;
+  const uint16_t fieldWidth = dsp_getwidth() + TIMEPOS ;
+
+  if ( !str || str[0] == '\0' )
+  {
+    oldstr = "" ;
+    return ;
+  }
+  if ( !bluetft_tft ) return ;
+
+  String newstr = String ( str ) ;
+  bool fullRedraw = oldstr.length() != newstr.length() ;
+  if ( fontArialBold11.ready() && !fullRedraw )
+  {
+    for ( uint16_t i = 0 ; i < newstr.length() ; i++ )
+    {
+      char oldchar[2] = { oldstr[i], '\0' } ;
+      char newchar[2] = { newstr[i], '\0' } ;
+      if ( fontArialBold11.textWidth ( oldchar ) != fontArialBold11.textWidth ( newchar ) )
+      {
+        fullRedraw = true ;
+        break ;
+      }
+    }
+  }
+
+  if ( fontArialBold11.ready() )
+  {
+    if ( fullRedraw )
+    {
+      dsp_fillRect ( 0, 0, fieldWidth, 14, BLACK ) ;
+      fontArialBold11.drawSingleLine ( *bluetft_tft, newstr.c_str(),
+                                        0, 0, fieldWidth, color, BLACK ) ;
+    }
+    else
+    {
+      int16_t x = 0 ;
+      for ( uint16_t i = 0 ; i < newstr.length() ; i++ )
+      {
+        char character[2] = { newstr[i], '\0' } ;
+        uint16_t width = fontArialBold11.textWidth ( character ) ;
+        if ( newstr[i] != oldstr[i] )
+        {
+          dsp_fillRect ( x, 0, width, 14, BLACK ) ;
+          fontArialBold11.drawSingleLine ( *bluetft_tft, character,
+                                            x, 0, width, color, BLACK ) ;
+        }
+        x += width ;
+      }
+    }
+  }
+  else if ( newstr != oldstr )
+  {
+    dsp_fillRect ( 0, 0, fieldWidth, 14, BLACK ) ;
+    dsp_setTextColor ( color ) ;
+    dsp_setCursor ( 0, 0 ) ;
+    dsp_print ( newstr ) ;
+  }
+  oldstr = newstr ;
 }
 
 
@@ -541,29 +640,114 @@ void bluetft_drawStationNumber ( const char* str, uint16_t color )
 }
 
 
+// Compact current/total SD track counter in the same area as the radio preset number.
+void bluetft_drawTrackNumber ( const char* str, uint16_t color )
+{
+  if ( !bluetft_tft ) return ;
+  const int16_t left = dsp_getwidth() - TRACKNUMWIDTH ;
+  dsp_fillRect ( left, bluetft_tftdata[2].y, TRACKNUMWIDTH,
+                 bluetft_tftdata[2].height, BLACK ) ;
+  if ( !str || !*str ) return ;
+  SmoothFont* font = &fontArialBold16 ;
+  if ( !font->ready() || font->textWidth ( str ) > TRACKNUMWIDTH )
+  {
+    font = &fontArialBold11 ;                            // Keep large track counts completely visible
+  }
+  if ( !font->ready() ) return ;
+  uint16_t width = font->textWidth ( str ) ;
+  int16_t x = dsp_getwidth() - width ;
+  if ( x < left ) x = left ;
+  int16_t y = bluetft_tftdata[2].y +
+              ( bluetft_tftdata[2].height - font->lineHeight() ) / 2 ;
+  font->drawSingleLine ( *bluetft_tft, str, x, y, TRACKNUMWIDTH,
+                         color, BLACK ) ;
+}
+
+
 //**************************************************************************************************
 //                                D R A W S T A T I O N L I S T                                   *
 //**************************************************************************************************
-void bluetft_drawStationList ( const char* const* rows, uint8_t count,
-                               uint8_t selectedRow )
+static String rotateUtf8Cycle ( const String& title, uint16_t characterOffset )
 {
-  if ( !bluetft_tft || !rows || !fontArialBold11.ready() ) return ;
-  dsp_erase() ;
+  String cycle = title + " * " ;
+  if ( cycle.isEmpty() ) return cycle ;
+  uint16_t characters = 0 ;
+  for ( uint16_t pos = 0 ; pos < cycle.length() ; characters++ )
+  {
+    uint8_t lead = (uint8_t)cycle[pos] ;
+    if ( ( lead & 0x80 ) == 0 ) pos++ ;
+    else if ( ( lead & 0xE0 ) == 0xC0 ) pos += 2 ;
+    else if ( ( lead & 0xF0 ) == 0xE0 ) pos += 3 ;
+    else pos++ ;
+  }
+  if ( !characters ) return cycle ;
+  characterOffset %= characters ;
+  uint16_t byteOffset = 0 ;
+  for ( uint16_t character = 0 ; character < characterOffset ; character++ )
+  {
+    uint8_t lead = (uint8_t)cycle[byteOffset] ;
+    if ( ( lead & 0x80 ) == 0 ) byteOffset++ ;
+    else if ( ( lead & 0xE0 ) == 0xC0 ) byteOffset += 2 ;
+    else if ( ( lead & 0xF0 ) == 0xE0 ) byteOffset += 3 ;
+    else byteOffset++ ;
+  }
+  String rotated = cycle.substring ( byteOffset ) +
+                   cycle.substring ( 0, byteOffset ) ;
+  return rotated + cycle ;                             // Enough text to fill the visible window
+}
+
+
+bool bluetft_drawStationList ( const char* const* rows, uint8_t count,
+                               uint8_t selectedRow, uint16_t scrollOffset,
+                               bool selectedOnly )
+{
+  if ( !bluetft_tft || !rows || !fontArialBold11.ready() ) return false ;
+  if ( !selectedOnly ) dsp_erase() ;
   uint8_t lineHeight = fontArialBold11.lineHeight() ;
   int16_t y = ( dsp_getheight() - count * lineHeight ) / 2 ;
+  bool selectedNeedsScroll = false ;
   for ( uint8_t row = 0 ; row < count ; row++ )
   {
     bool selected = row == selectedRow ;
+    if ( selectedOnly && !selected )
+    {
+      y += lineHeight ;
+      continue ;
+    }
     uint16_t background = selected ? YELLOW : BLACK ;
     uint16_t foreground = selected ? BLACK : WHITE ;
-    if ( selected ) dsp_fillRect ( 0, y, dsp_getwidth(), lineHeight, background ) ;
-    SmoothFont* rowFont = &fontArialBold11 ;
-    if ( rowFont->textWidth ( rows[row] ) > dsp_getwidth() - 2 &&
-         fontArialBold8.ready() ) rowFont = &fontArialBold8 ;
-    int16_t rowY = y + ( lineHeight - rowFont->lineHeight() ) / 2 ;
-    rowFont->draw ( *bluetft_tft, rows[row], 1, rowY,
-                    dsp_getwidth() - 2, rowFont->lineHeight(),
-                    foreground, background ) ;
+
+    String complete = rows[row] ;
+    int separator = complete.indexOf ( ' ', 1 ) ;
+    String prefix = separator >= 0 ? complete.substring ( 0, separator + 1 ) : String() ;
+    String title = separator >= 0 ? complete.substring ( separator + 1 ) : complete ;
+    uint16_t prefixWidth = fontArialBold11.textWidth ( prefix.c_str() ) ;
+    uint16_t titleWidth = dsp_getwidth() - 2 > prefixWidth ?
+                          dsp_getwidth() - 2 - prefixWidth : 0 ;
+    if ( selected )
+    {
+      selectedNeedsScroll = titleWidth &&
+                            fontArialBold11.textWidth ( title.c_str() ) > titleWidth ;
+    }
+    if ( !selectedOnly )
+    {
+      dsp_fillRect ( 0, y, dsp_getwidth(), lineHeight, background ) ;
+      fontArialBold11.drawSingleLine ( *bluetft_tft, prefix.c_str(), 1, y,
+                                       prefixWidth, foreground, background ) ;
+    }
+    if ( titleWidth )
+    {
+      String displayedTitle = title ;
+      if ( selected && selectedNeedsScroll )
+      {
+        displayedTitle = rotateUtf8Cycle ( title, scrollOffset ) ;
+      }
+      dsp_fillRect ( 1 + prefixWidth, y, titleWidth, lineHeight, background ) ;
+      fontArialBold11.drawSingleLine ( *bluetft_tft, displayedTitle.c_str(),
+                                       1 + prefixWidth, y, titleWidth,
+                                       foreground, background ) ;
+    }
     y += lineHeight ;
   }
+  return selectedNeedsScroll ;
 }

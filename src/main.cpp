@@ -114,13 +114,16 @@
 
 //
 // Define the version number, the format used is the HTTP standard.
-#define VERSION     "Sun, 13 Sep 2026 11:45:00 GMT"
+#define VERSION     "Mon, 14 Sep 2026 20:30:00 GMT"
 //
 #include <Arduino.h>                                      // Standard include for Platformio Arduino projects
 #include "soc/soc.h"                                      // For brown-out detector setting
 #include "soc/rtc_cntl_reg.h"                             // For brown-out detector settingtest
 //#include <esp_log.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>                            // TLS client for HTTPS radio streams
+#include <esp_wifi.h>                                    // WiFi power-save and disconnect diagnostics
+#include <vector>
 #include "config.h"                                       // Specify display type, decoder type
 #include <nvs.h>                                          // Access to NVS
 #include <PubSubClient.h>                                 // MTTQ access
@@ -130,9 +133,6 @@
   #define ETH_CLK_MODE    ETH_CLOCK_GPIO0_IN              // External clock from crystal oscillator
   #define ETH_TYPE        ETH_PHY_LAN8720                 // Type of controller
   #define ETH_ADDR        1                               // I2C address of Ethernet PHY
-#else
-  #include <WiFiMulti.h>                                  // Handle multiple WiFi networks
-  WiFiMulti wifiMulti ;                                   // Object for WiFiMulti
 #endif
 #include <ESPAsyncWebServer.h>                            // For Async Web server
 #include <ESPmDNS.h>                                      // For multicast DNS
@@ -191,6 +191,7 @@
 //**************************************************************************************************
 void        tftlog ( const char *str, bool newline = false ) ;
 bool        showstreamtitle ( const char* ml, bool full = false ) ;
+bool        isAdvertisementMetadata ( const char* metadata ) ;
 void        handlebyte_ch ( uint8_t b ) ;
 void        handleCmd()  ;
 const char* analyzeCmd ( const char* str ) ;
@@ -200,6 +201,7 @@ String      nvsgetstr ( const char* key ) ;
 bool        nvssearch ( const char* key ) ;
 void        sdfuncs() ;
 void        stop_mp3client () ;
+void        pump_secure_stream () ;
 void        tftset ( uint16_t inx, const char *str ) ;
 void        tftset ( uint16_t inx, String& str ) ;
 void        playtask ( void* parameter ) ;                 // Task to play the stream on VS1053 or HELIX decoder
@@ -220,6 +222,7 @@ bool        readhostfrompref ( int16_t preset, String* host, String* hsym = NULL
 void        enterStationDigit ( uint8_t digit ) ;
 void        confirmStationNumber() ;
 void        openStationList() ;
+void        openSDList() ;
 void        moveStationList ( int8_t direction, uint8_t count ) ;
 void        confirmStationList() ;
 
@@ -287,8 +290,8 @@ struct ini_struct
 
 struct WifiInfo_t                                     // For list with WiFi info
 {
-  char * ssid ;                                       // SSID for an entry
-  char * passphrase ;                                 // Passphrase for an entry
+  String ssid ;                                       // SSID for an entry
+  String passphrase ;                                 // Passphrase for an entry
 } ;
 
 // Preset info
@@ -329,11 +332,19 @@ preset_info_t        presetinfo ;                        // Info about the curre
 ini_struct           ini_block ;                         // Holds configurable data
 AsyncWebServer       cmdserver ( 80 ) ;                  // Instance of embedded webserver, port 80
 AsyncClient*         mp3client = NULL ;                  // An instance of the mp3 client
+WiFiClientSecure     mp3secureclient ;                    // Synchronous TLS client for HTTPS streams
+bool                 secure_stream_active = false ;      // True while HTTPS transport is selected
+bool                 stream_redirect_request = false ;   // Next connection follows a Location header
+bool                 stream_redirect_playlist = false ;  // Redirect belongs to a playlist response
+uint8_t              stream_redirect_count = 0 ;         // Protect against redirect loops
+bool                 ad_suppression_active = false ;      // Drop audio until normal metadata returns
 WiFiClient           wmqttclient ;                       // An instance for mqtt
 PubSubClient         mqttclient ( wmqttclient ) ;        // Client for MQTT subscriber
 TaskHandle_t         maintask ;                          // Taskhandle for main task
 TaskHandle_t         xplaytask ;                         // Task handle for playtask
 TaskHandle_t         xsdtask ;                           // Task handle for SD task
+volatile bool        player_init_done = false ;          // Decoder initialization has finished
+volatile bool        player_ready = false ;              // Hardware decoder passed communication test
 hw_timer_t*          timer = NULL ;                      // For timer
 char                 timetxt[9] ;                        // Converted timeinfo
 const qdata_struct   stopcmd = {QSTOPSONG} ;             // Command for radio/SD
@@ -390,8 +401,18 @@ bool                 station_number_entry = false ;      // Numeric preset entry
 String               station_number_input ;              // Digits entered on the remote
 uint32_t             station_number_time = 0 ;           // Time of the latest entered digit
 bool                 station_list_active = false ;        // Full-screen station list is visible
+bool                 station_list_sd = false ;            // Full-screen list currently shows SD tracks
 int16_t              station_list_preset = 0 ;            // Preset selected in station list
+int16_t              station_list_sd_index = 0 ;          // Track selected in SD list
+uint16_t             station_list_scroll = 0 ;            // UTF-8 character offset in station title
+uint32_t             station_list_scroll_time = 0 ;       // Time of the latest marquee step
+bool                 station_list_scroll_needed = false ; // Selected title exceeds its row width
 const char*          fixedwifi = "" ;                    // Used for FIXEDWIFI option
+#ifndef ETHERNET
+std::vector<WifiInfo_t> wifilist ;                        // Credentials tried directly in list order
+volatile bool        wifi_assoc_event = false ;           // Association attempt ended unsuccessfully
+volatile uint8_t     wifi_assoc_reason = 0 ;              // ESP-IDF disconnect reason
+#endif
 File                 SPIFFSfile ;                        /// File handle for SPIFFS file
 
 // nvs stuff
@@ -722,6 +743,10 @@ mqttpubc         mqttpub ;                                    // Instance for mq
 
 // Include software for SD card.  Will include dummy if "SDCARD" is not defined
 #include "SDcard.h"                                         // For SD card interface
+#if defined(SDCARD) && defined(BLUETFT)
+  #include <TJpg_Decoder.h>                                  // Render embedded ID3 JPEG cover art
+  static bool toggleSDCover() ;                              // IR 0 toggles embedded cover view
+#endif
 
 //**************************************************************************************************
 //                                  M Y Q U E U E S E N D                                          *
@@ -1296,6 +1321,33 @@ void IRAM_ATTR isr_enc_switch()
 #endif
 
 //**************************************************************************************************
+//                         I S  A D V E R T I S E M E N T  M E T A D A T A                        *
+//**************************************************************************************************
+// Detect explicit ICY advertisement fields.  laut.fm also marks dynamically inserted ads with    *
+// StreamUrl='0'; that rule is deliberately limited to laut.fm to avoid false positives elsewhere. *
+//**************************************************************************************************
+bool isAdvertisementMetadata ( const char* metadata )
+{
+  if ( metadata == NULL || *metadata == '\0' ) return false ;
+
+  if ( strstr ( metadata, "AdCreativeId=" ) ||
+       strstr ( metadata, "adw_ad=" )       ||
+       strstr ( metadata, "Advertiser=" )   ||
+       strstr ( metadata, "adId=" ) )
+  {
+    return true ;
+  }
+
+  String lowerhost = presetinfo.host ;
+  lowerhost.toLowerCase() ;
+  const bool lautstream = lowerhost.indexOf ( ".stream.laut.fm/" ) >= 0 ;
+  return lautstream &&
+         ( strstr ( metadata, "StreamUrl='0'" ) ||
+           strstr ( metadata, "StreamUrl=\"0\"" ) ) ;
+}
+
+
+//**************************************************************************************************
 //                                S H O W S T R E A M T I T L E                                    *
 //**************************************************************************************************
 // Show artist and songtitle if present in metadata.                                               *
@@ -1375,15 +1427,175 @@ void setdatamode ( datamode_t newmode )
 //**************************************************************************************************
 // Disconnect from the server.                                                                     *
 //**************************************************************************************************
+struct stream_url_t
+{
+  bool     secure ;
+  String   host ;
+  String   hostheader ;
+  String   path ;
+  uint16_t port ;
+} ;
+
+
+// Split a radio URL without changing the value stored in presetinfo.host.  Old preferences that
+// contain only host[:port]/path remain HTTP URLs; explicit http:// and https:// are preserved.
+static bool parse_stream_url ( const String& source, stream_url_t& result )
+{
+  String url = source ;
+  url.trim() ;
+  String lowerurl = url ;
+  lowerurl.toLowerCase() ;
+  result.secure = false ;
+  if ( lowerurl.startsWith ( "https://" ) )
+  {
+    result.secure = true ;
+    url.remove ( 0, 8 ) ;
+  }
+  else if ( lowerurl.startsWith ( "http://" ) )
+  {
+    url.remove ( 0, 7 ) ;
+  }
+  else if ( url.indexOf ( "://" ) >= 0 )
+  {
+    ESP_LOGE ( TAG, "Unsupported stream URL scheme: %s", source.c_str() ) ;
+    return false ;
+  }
+
+  int slash = url.indexOf ( '/' ) ;
+  String authority = slash >= 0 ? url.substring ( 0, slash ) : url ;
+  result.path = slash >= 0 ? url.substring ( slash ) : String ( "/" ) ;
+  int fragment = result.path.indexOf ( '#' ) ;
+  if ( fragment >= 0 ) result.path.remove ( fragment ) ;
+  result.port = result.secure ? 443 : 80 ;
+
+  int colon = authority.lastIndexOf ( ':' ) ;
+  if ( colon >= 0 )
+  {
+    long parsedport = authority.substring ( colon + 1 ).toInt() ;
+    if ( parsedport < 1 || parsedport > 65535 )
+    {
+      ESP_LOGE ( TAG, "Invalid stream port in URL: %s", source.c_str() ) ;
+      return false ;
+    }
+    result.port = (uint16_t) parsedport ;
+    result.host = authority.substring ( 0, colon ) ;
+  }
+  else
+  {
+    result.host = authority ;
+  }
+  result.host.trim() ;
+  if ( result.host.isEmpty() || result.host.indexOf ( ' ' ) >= 0 ||
+       result.host.indexOf ( '\r' ) >= 0 || result.host.indexOf ( '\n' ) >= 0 )
+  {
+    ESP_LOGE ( TAG, "Invalid stream host in URL: %s", source.c_str() ) ;
+    return false ;
+  }
+
+  result.hostheader = result.host ;
+  if ( ( result.secure && result.port != 443 ) ||
+       ( !result.secure && result.port != 80 ) )
+  {
+    result.hostheader += String ( ':' ) + String ( result.port ) ;
+  }
+  return true ;
+}
+
+
+// Resolve all Location forms used in HTTP: absolute URL, scheme-relative URL, absolute path,
+// query-only target and a path relative to the current resource.
+static String resolve_redirect_url ( const String& baseurl, String location )
+{
+  location.trim() ;
+  String lowerlocation = location ;
+  lowerlocation.toLowerCase() ;
+  if ( lowerlocation.startsWith ( "http://" ) || lowerlocation.startsWith ( "https://" ) )
+  {
+    return location ;
+  }
+
+  stream_url_t base ;
+  if ( !parse_stream_url ( baseurl, base ) || location.isEmpty() ) return String() ;
+  String prefix = String ( base.secure ? "https://" : "http://" ) + base.hostheader ;
+  if ( location.startsWith ( "//" ) )
+  {
+    return String ( base.secure ? "https:" : "http:" ) + location ;
+  }
+  if ( location[0] == '/' ) return prefix + location ;
+
+  String basepath = base.path ;
+  int query = basepath.indexOf ( '?' ) ;
+  if ( query >= 0 ) basepath.remove ( query ) ;
+  if ( location[0] == '?' ) return prefix + basepath + location ;
+  int lastslash = basepath.lastIndexOf ( '/' ) ;
+  if ( lastslash >= 0 ) basepath.remove ( lastslash + 1 ) ;
+  else basepath = "/" ;
+  return prefix + basepath + location ;
+}
+
+
+static bool begin_stream_redirect ( const String& location )
+{
+  if ( stream_redirect_count >= 5 )
+  {
+    ESP_LOGE ( TAG, "Too many stream redirects; request stopped" ) ;
+    return false ;
+  }
+  String redirected = resolve_redirect_url ( presetinfo.host, location ) ;
+  if ( redirected.isEmpty() )
+  {
+    ESP_LOGE ( TAG, "Invalid redirect target: %s", location.c_str() ) ;
+    return false ;
+  }
+  stream_redirect_count++ ;
+  stream_redirect_request = true ;
+  stream_redirect_playlist = ( datamode == PLAYLISTHEADER ) ;
+  presetinfo.station_state = ST_REDIRECT ;
+  presetinfo.host = redirected ;
+  ESP_LOGI ( TAG, "Follow redirect %u to %s",
+             stream_redirect_count, redirected.c_str() ) ;
+  return true ;
+}
+
+
 void stop_mp3client ()
 {
   queueToPt ( QSTOPSONG ) ;                        // Queue a request to stop the song
+  if ( secure_stream_active )                       // HTTPS transport selected?
+  {
+    ESP_LOGI ( TAG, "Stopping HTTPS client" ) ;
+    mp3secureclient.stop() ;
+    secure_stream_active = false ;
+  }
   while ( mp3client && mp3client->connected() )    // Client active and connected?
   {
     ESP_LOGI ( TAG, "Stopping client" ) ;          // Yes, stop connection to host
     //mp3client->close() ;                         // Causes memory leak!
     mp3client->abort() ;                           // This works better
     vTaskDelay ( 500 / portTICK_PERIOD_MS ) ;
+  }
+}
+
+
+// WiFiClientSecure is synchronous, unlike the HTTP AsyncClient.  Drain a bounded amount on every
+// main-loop pass and feed it into the existing header/metadata/audio parser.
+void pump_secure_stream ()
+{
+  if ( !secure_stream_active || stream_redirect_request ) return ;
+  static uint8_t buffer[1460] ;
+  size_t handled = 0 ;
+  while ( mp3secureclient.available() > 0 && handled < 5840 )
+  {
+    size_t available = (size_t)mp3secureclient.available() ;
+    size_t wanted = available < sizeof ( buffer ) ? available : sizeof ( buffer ) ;
+    int received = mp3secureclient.read ( buffer, wanted ) ;
+    if ( received <= 0 ) break ;
+    handled += received ;
+    for ( int i = 0 ; i < received ; i++ )
+    {
+      handlebyte_ch ( buffer[i] ) ;
+      if ( stream_redirect_request ) return ;        // Do not parse a redirect response body
+    }
   }
 }
 
@@ -1395,19 +1607,24 @@ void stop_mp3client ()
 //**************************************************************************************************
 bool connecttohost()
 {
-  int         inx ;                                  // Position of ":" in hostname
-  uint16_t    port = 80 ;                            // Port number for host
-  String      extension = "/" ;                      // May be like "/mp3" in "skonto.ls.lv:8002/mp3"
-  String      hostwoext ;                            // Host without extension and portnumber
+  stream_url_t target ;                              // Parsed HTTP(S) URL
   String      auth  ;                                // For basic authentication
-  char        getreq[500] ;                          // GET command for MP3 host
+  String      getreq ;                               // GET command for MP3 host
   int         retrycount = 0 ;                       // Count for connect
   size_t      len ;                                  // Length of GET request
   bool        res = false ;                          // Function result, assume bad result
+  bool        redirected_playlist = stream_redirect_request && stream_redirect_playlist ;
 
   stop_mp3client() ;                                 // Disconnect if still connected
+  ad_suppression_active = false ;                    // A new connection starts with normal audio
   chomp ( presetinfo.host ) ;                        // Do some filtering
-  hostwoext = presetinfo.host ;                      // Assume host does not have extension
+  if ( !stream_redirect_request )                    // User/preset initiated a new request?
+  {
+    stream_redirect_count = 0 ;                      // Start a fresh redirect chain
+  }
+  stream_redirect_request = false ;
+  stream_redirect_playlist = false ;
+  if ( !parse_stream_url ( presetinfo.host, target ) ) return false ;
   ESP_LOGI ( TAG, "Connect to host %s",
              presetinfo.host.c_str() ) ;
   tftset ( 0, NAME ) ;                               // Set screen segment text top line
@@ -1418,7 +1635,11 @@ bool connecttohost()
   icyname_raw = "" ;                                // Forget station name from previous response
   setdatamode ( INIT ) ;                             // Start default in INIT mode
   chunked = false ;                                  // Assume not chunked
-  if ( presetinfo.host.endsWith ( ".m3u" ) )         // Is it an m3u playlist?
+  String playlistpath = target.path ;
+  int playlistquery = playlistpath.indexOf ( '?' ) ;
+  if ( playlistquery >= 0 ) playlistpath.remove ( playlistquery ) ;
+  playlistpath.toLowerCase() ;
+  if ( redirected_playlist || playlistpath.endsWith ( ".m3u" ) ) // Is it an m3u playlist?
   {
     presetinfo.station_state = ST_PLAYLIST ;         // Yes, change station state
     presetinfo.playlisthost = presetinfo.host ;      // Save copy of playlist URL
@@ -1426,65 +1647,67 @@ bool connecttohost()
     ESP_LOGI ( TAG, "Playlist request, entry %d",
                presetinfo.playlistnr ) ;
   }
-  // In the URL there may be an extension, like noisefm.ru:8000/play.m3u&t=.m3u
-  inx = presetinfo.host.indexOf ( "/" ) ;            // Search for begin of extension
-  if ( inx > 0 )                                     // Is there an extension?
+  if ( nvssearch ( "basicauth" ) )                  // Does "basicauth" exist?
   {
-    extension = hostwoext.substring ( inx ) ;        // Yes, change the default
-    hostwoext = hostwoext.substring ( 0, inx ) ;     // Host without extension
-  }
-  // In the host there may be a portnumber
-  inx = hostwoext.indexOf ( ":" ) ;                  // Search for separator
-  if ( inx >= 0 )                                    // Portnumber available?
-  {
-    port = hostwoext.substring ( inx + 1 ).toInt() ; // Get portnumber as integer
-    hostwoext = hostwoext.substring ( 0, inx ) ;     // Host without portnumber
-  }
-  //ESP_LOGI ( TAG, "Connect to %s on port %d, extension %s",
-  //           hostwoext.c_str(), port, extension.c_str() ) ;
-  if ( mp3client->connect ( hostwoext.c_str(), port ) )
-  {
-    if ( nvssearch ( "basicauth" ) )                 // Does "basicauth" exists?
+    auth = nvsgetstr ( "basicauth" ) ;               // Use basic authentication?
+    if ( auth != "" )                                // Should be user:passwd
     {
-      auth = nvsgetstr ( "basicauth" ) ;             // Use basic authentication?
-      if ( auth != "" )                              // Should be user:passwd
-      { 
-         auth = base64::encode ( auth.c_str() ) ;    // Encode
-         auth = String ( "Authorization: Basic " ) +
-                auth + String ( "\r\n" ) ;
+      auth = base64::encode ( auth.c_str() ) ;        // Encode
+      auth = String ( "Authorization: Basic " ) + auth + String ( "\r\n" ) ;
+    }
+  }
+  getreq = String ( "GET " ) + target.path + String ( " HTTP/1.1\r\n" ) +
+           String ( "Host: " ) + target.hostheader + String ( "\r\n" ) +
+           String ( "Icy-MetaData: 1\r\n" ) + auth +
+           String ( "User-Agent: ESP32-Radio-V2\r\n" ) +
+           String ( "Accept: */*\r\n" ) +
+           String ( "Connection: close\r\n\r\n" ) ;
+
+  ESP_LOGI ( TAG, "Connect to %s on port %u using %s, path %s",
+             target.host.c_str(), target.port,
+             target.secure ? "HTTPS" : "HTTP", target.path.c_str() ) ;
+  if ( target.secure )
+  {
+    mp3secureclient.setInsecure() ;                   // Radio URLs rarely provide a stable CA chain
+    mp3secureclient.setTimeout ( 15000 ) ;
+    if ( mp3secureclient.connect ( target.host.c_str(), target.port ) )
+    {
+      secure_stream_active = true ;
+      ESP_LOGI ( TAG, "send HTTPS GET command" ) ;
+      res = mp3secureclient.print ( getreq ) == getreq.length() ;
+      if ( !res )
+      {
+        ESP_LOGE ( TAG, "HTTPS GET request was not sent completely" ) ;
+        mp3secureclient.stop() ;
+        secure_stream_active = false ;
       }
     }
+  }
+  else if ( mp3client && mp3client->connect ( target.host.c_str(), target.port ) )
+  {
     while ( mp3client->disconnected() )              // Wait for connect
     {
       if ( retrycount++ > 50 )                       // For max 5 seconds
       {
-        mp3client->stop() ;                          // No connect, stop
+        mp3client->abort() ;                         // No connect; avoid deprecated stop() and close() leak
         break ;                                      //
       }
       vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;
     }
     if ( mp3client->connected() )
     {
-      sprintf ( getreq, "GET %s HTTP/1.0\r\n"
-                        "Host: %s\r\n"
-                        "Icy-MetaData: 1\r\n"
-                        "%s"                              // Auth
-                        "Connection: close\r\n\r\n",      // Close when finished
-                extension.c_str(),
-                hostwoext.c_str(),
-                auth.c_str() ) ;
-      ESP_LOGI ( TAG, "send GET command" ) ;
+      ESP_LOGI ( TAG, "send HTTP GET command" ) ;
       if ( mp3client->canSend() )
       {
-        len = strlen ( getreq ) ;                         // Length of string to send
-        res = mp3client->write ( getreq, len ) == len  ;  // Send GET request, set result
+        len = getreq.length() ;
+        res = mp3client->write ( getreq.c_str(), len ) == len ;
       }
     }
   }
-  else
+  if ( !res )
   {
-    ESP_LOGE ( TAG, "Request %s failed!",                    // Report error
-               presetinfo.host.c_str() ) ;
+    ESP_LOGE ( TAG, "%s request %s failed!",
+               target.secure ? "HTTPS" : "HTTP", presetinfo.host.c_str() ) ;
   }
   return res ;
 }
@@ -1592,57 +1815,141 @@ bool connectETH()
 }
 
 #else
+static const char* wifi_reason_text ( uint8_t reason )
+{
+  switch ( reason )
+  {
+    case 0:   return "no disconnect reason reported" ;
+    case 2:   return "authentication expired" ;
+    case 4:   return "association expired" ;
+    case 15:  return "four-way handshake timeout" ;
+    case 201: return "access point not found" ;
+    case 202: return "authentication failed" ;
+    case 203: return "association failed" ;
+    case 204: return "handshake timeout" ;
+    case 208: return "association comeback time too long" ;
+    default:  return "other disconnect reason" ;
+  }
+}
+
+
+void WiFiEventHandler ( WiFiEvent_t event, WiFiEventInfo_t info )
+{
+  if ( event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED )
+  {
+    wifi_assoc_reason = info.wifi_sta_disconnected.reason ;
+    wifi_assoc_event = true ;
+  }
+}
+
+
 //**************************************************************************************************
 //                                       C O N N E C T W I F I                                     *
 //**************************************************************************************************
-// Connect to WiFi using the SSID's available in wifiMulti.                                        *
-// If only one AP if found in preferences (i.e. wifi_00) the connection is made without            *
-// using wifiMulti.                                                                                *
+// Try every configured SSID directly.  Each network gets several attempts and a driver event      *
+// terminates a refused association immediately instead of waiting for the complete timeout.       *
 // If connection fails, an AP is created and the function returns false.                           *
 //**************************************************************************************************
 bool connectwifi()
 {
-  bool        localAP = false ;                         // True if only local AP is left
+  bool        connected = false ;                       // Connected to a configured network
   const char* pIP ;                                     // Pointer to IP address
   WifiInfo_t  winfo ;                                   // Entry from wifilist
 
+  WiFi.softAPdisconnect ( true ) ;                      // Stop a possible configuration AP
   WiFi.mode ( WIFI_STA ) ;                              // This ESP is a station
-  WiFi.disconnect ( true ) ;                            // After restart the router could
-  WiFi.softAPdisconnect ( true ) ;                      // still keep the old connection
-  vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;            // Silly things to start connection
-  WiFi.mode ( WIFI_STA ) ;
-  vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;
-  if ( wifiMulti.run() == WL_NO_SSID_AVAIL )            // Connect to best network
+  static bool event_registered = false ;
+  if ( !event_registered )
   {
-    localAP = true ;
+    WiFi.onEvent ( WiFiEventHandler ) ;                 // Register only once
+    event_registered = true ;
   }
-  else
+  WiFi.setSleep ( false ) ;                             // Keep stream connection responsive
+  esp_err_t ps_result = esp_wifi_set_ps ( WIFI_PS_NONE ) ;
+  if ( ps_result != ESP_OK )
   {
-    if ( WiFi.waitForConnectResult() != WL_CONNECTED )  // Try to connect
+    ESP_LOGW ( TAG, "Could not disable WiFi power save, error 0x%X",
+               (unsigned)ps_result ) ;
+  }
+  WiFi.setAutoReconnect ( true ) ;
+  vTaskDelay ( 300 / portTICK_PERIOD_MS ) ;
+
+  const uint8_t maxattempts = 3 ;
+  for ( size_t network = 0 ; network < wifilist.size() && !connected ; network++ )
+  {
+    winfo = wifilist[network] ;
+    for ( uint8_t attempt = 1 ; attempt <= maxattempts && !connected ; attempt++ )
     {
-      localAP = true ;                                  // Error, setup own AP
+      ESP_LOGI ( TAG, "WiFi attempt %u/%u for SSID '%s'",
+                 attempt, maxattempts, winfo.ssid.c_str() ) ;
+
+      // Reset the association without erasing stored credentials or stopping the driver.
+      WiFi.disconnect ( false, false ) ;
+      vTaskDelay ( 250 / portTICK_PERIOD_MS ) ;
+      wifi_assoc_event = false ;
+      wifi_assoc_reason = 0 ;
+      WiFi.begin ( winfo.ssid.c_str(), winfo.passphrase.c_str() ) ;
+
+      const uint32_t started = millis() ;
+      while ( WiFi.status() != WL_CONNECTED &&
+              !wifi_assoc_event &&
+              millis() - started < 10000UL )
+      {
+        vTaskDelay ( 50 / portTICK_PERIOD_MS ) ;
+      }
+      connected = WiFi.status() == WL_CONNECTED ;
+      if ( connected )
+      {
+        ESP_LOGI ( TAG, "WiFi association succeeded for '%s' after %lu ms",
+                   winfo.ssid.c_str(), (unsigned long)( millis() - started ) ) ;
+        break ;
+      }
+
+      const uint8_t reason = wifi_assoc_reason ;
+      ESP_LOGW ( TAG, "WiFi attempt failed: SSID '%s', status %d, reason %u (%s)",
+                 winfo.ssid.c_str(), (int)WiFi.status(), reason,
+                 wifi_reason_text ( reason ) ) ;
+      WiFi.disconnect ( false, false ) ;
+      if ( reason == 208 )                             // AP explicitly requests a later retry
+      {
+        vTaskDelay ( 1200 / portTICK_PERIOD_MS ) ;
+      }
+      else
+      {
+        vTaskDelay ( ( wifi_assoc_event ? 750 : 1000 ) / portTICK_PERIOD_MS ) ;
+      }
+      wifi_assoc_event = false ;
+      wifi_assoc_reason = 0 ;
     }
   }
-  if ( localAP )                                        // Must setup local AP?
+
+  if ( !connected )                                      // Must setup local AP?
   {
-    ESP_LOGI ( TAG, "WiFi Failed!  Trying to setup AP with"
+    ESP_LOGI ( TAG, "WiFi failed after direct retries. Trying to setup AP with"
                " name %s and password %s.",
                NAME, NAME ) ;
-    WiFi.disconnect ( true ) ;                          // After restart the router could
-    WiFi.softAPdisconnect ( true ) ;                    // still keep the old connection
+    WiFi.disconnect ( false, false ) ;                  // Preserve configured credentials
+    WiFi.mode ( WIFI_AP_STA ) ;
     if ( ! WiFi.softAP ( NAME, NAME ) )                 // This ESP will be an AP
     {
       ESP_LOGE ( TAG, "AP failed" ) ;                   // Setup of AP failed
     }
-    ipaddress = String ( "192.168.4.1" ) ;              // Fixed IP address
+    ipaddress = WiFi.softAPIP().toString() ;
   }
   else
   {
+    const uint32_t dhcp_started = millis() ;
+    while ( WiFi.localIP() == IPAddress ( 0, 0, 0, 0 ) &&
+            millis() - dhcp_started < 5000UL )
+    {
+      vTaskDelay ( 50 / portTICK_PERIOD_MS ) ;
+    }
     tftlog ( "SSID = " ) ;                              // Show SSID on display
     tftlog ( WiFi.SSID().c_str(), true ) ;
-    ESP_LOGI ( TAG, "SSID = %s",                        // Format string with SSID connected to
-               WiFi.SSID().c_str() ) ;
+    ESP_LOGI ( TAG, "SSID = %s, RSSI = %d dBm",
+               WiFi.SSID().c_str(), WiFi.RSSI() ) ;
     ipaddress = WiFi.localIP().toString() ;             // Form IP address
+    ESP_LOGI ( TAG, "WiFi network ready for stream connections" ) ;
   }
   pIP = ipaddress.c_str() ;                             // As c-string
   ESP_LOGI ( TAG, "IP = %s", pIP ) ;
@@ -1652,7 +1959,7 @@ bool connectwifi()
     vTaskDelay ( 2000 / portTICK_PERIOD_MS ) ;          // Show for some time
     dsp_println ( "\f" ) ;                              // Select new page if NEXTION 
   #endif
-  return ( localAP == false ) ;                         // Return result of connection
+  return connected ;                                    // False means configuration AP mode
 }
 #endif
 
@@ -1668,7 +1975,12 @@ void otastart()
 
   ESP_LOGI ( TAG, "%s", p ) ;                      // Show event for debug
   tftset ( 2, p ) ;                                // Set screen segment bottom part
-  mp3client->abort() ;                             // Stop client
+  if ( secure_stream_active )                      // Stop either active stream transport
+  {
+    mp3secureclient.stop() ;
+    secure_stream_active = false ;
+  }
+  if ( mp3client ) mp3client->abort() ;
   timerAlarmDisable ( timer ) ;                    // Disable the timer
   disableCore0WDT() ;                              // Disable watchdog core 0
   disableCore1WDT() ;                              // Disable watchdog core 1
@@ -1771,14 +2083,29 @@ static bool findPreset ( int16_t start, int8_t direction, uint8_t count,
 static void restoreRadioView()
 {
   station_list_active = false ;
+  station_list_sd = false ;
+  station_list_scroll_needed = false ;
   if ( dsp_ok ) dsp_erase() ;
   displaytime ( "" ) ;
+  #if defined(SDCARD) && defined(BLUETFT)
+    if ( SD_playing )
+    {
+      String progressText = getSDProgressText() ;
+      tftdata[0].str = progressText ;
+      displayplaytime ( "" ) ;                           // Force a clean incremental redraw
+      for ( uint8_t i = 0 ; i < 3 && i < TFTSECS ; i++ )
+      {
+        tftdata[i].update_req = true ;                   // Restore title and artist after menu
+      }
+      return ;
+    }
+  #endif
   tftset ( 0, NAME ) ;
   tftset ( 1, "" ) ;
   tftset ( 2, presetinfo.hsym ) ;
 }
 
-static void drawStationList()
+static void drawStationList ( bool selectedOnly = false )
 {
   #ifdef BLUETFT
     const uint8_t rowCount = 7 ;
@@ -1786,28 +2113,99 @@ static void drawStationList()
     String rowText[rowCount] ;
     const char* rows[rowCount] ;
     int16_t rowPreset[rowCount] ;
-    rowPreset[middle] = station_list_preset ;
-    for ( int8_t row = middle - 1 ; row >= 0 ; row-- )
+    rowPreset[middle] = station_list_sd ? station_list_sd_index : station_list_preset ;
+    if ( station_list_sd )
     {
-      rowPreset[row] = rowPreset[row + 1] ;
-      findPreset ( rowPreset[row + 1], -1, 1, &rowPreset[row] ) ;
+      #ifdef SDCARD
+      if ( SD_filecount <= 0 ) return ;
+      if ( !selectedOnly )
+      {
+        for ( int8_t row = middle - 1 ; row >= 0 ; row-- )
+        {
+          rowPreset[row] = rowPreset[row + 1] - 1 ;
+        }
+        for ( uint8_t row = middle + 1 ; row < rowCount ; row++ )
+        {
+          rowPreset[row] = rowPreset[row - 1] + 1 ;
+        }
+      }
+      #endif
     }
-    for ( uint8_t row = middle + 1 ; row < rowCount ; row++ )
+    else if ( !selectedOnly )
     {
-      rowPreset[row] = rowPreset[row - 1] ;
-      findPreset ( rowPreset[row - 1], 1, 1, &rowPreset[row] ) ;
+      for ( int8_t row = middle - 1 ; row >= 0 ; row-- )
+      {
+        rowPreset[row] = rowPreset[row + 1] ;
+        findPreset ( rowPreset[row + 1], -1, 1, &rowPreset[row] ) ;
+      }
+      for ( uint8_t row = middle + 1 ; row < rowCount ; row++ )
+      {
+        rowPreset[row] = rowPreset[row - 1] ;
+        findPreset ( rowPreset[row - 1], 1, 1, &rowPreset[row] ) ;
+      }
     }
-    for ( uint8_t row = 0 ; row < rowCount ; row++ )
+    uint8_t firstRow = selectedOnly ? middle : 0 ;
+    uint8_t lastRow = selectedOnly ? middle + 1 : rowCount ;
+    #ifdef SDCARD
+      int16_t savedSDIndex = SD_curindex ;
+      bool savedRandomPlay = randomplay ;
+    #endif
+    for ( uint8_t row = firstRow ; row < lastRow ; row++ )
     {
       String host, name ;
-      readhostfrompref ( rowPreset[row], &host, &name ) ;
-      if ( name.isEmpty() ) name = host ;
+      if ( station_list_sd )
+      {
+        #ifdef SDCARD
+          if ( rowPreset[row] >= 0 && rowPreset[row] < SD_filecount )
+          {
+            const char* path = getSDFileName ( rowPreset[row] ) ;
+            name = path ? String ( path ) : String ( "" ) ;
+            int slash = name.lastIndexOf ( '/' ) ;
+            if ( slash >= 0 ) name.remove ( 0, slash + 1 ) ;
+            int dot = name.lastIndexOf ( '.' ) ;
+            if ( dot > 0 ) name.remove ( dot ) ;
+          }
+        #endif
+      }
+      else
+      {
+        readhostfrompref ( rowPreset[row], &host, &name ) ;
+        if ( name.isEmpty() ) name = host ;
+      }
       chomp ( name ) ;
-      rowText[row] = String ( rowPreset[row] == presetinfo.preset ? ">" : " " ) +
-                     String ( rowPreset[row] ) + " " + name ;
+      if ( station_list_sd )
+      {
+        #ifdef SDCARD
+          if ( rowPreset[row] >= 0 && rowPreset[row] < SD_filecount )
+          {
+            rowText[row] = String ( row == middle ? ">" : " " ) +
+                           String ( rowPreset[row] + 1 ) + " " + name ;
+          }
+          else
+          {
+            rowText[row] = "" ;                          // Never repeat tracks into empty rows
+          }
+        #else
+          rowText[row] = "" ;
+        #endif
+      }
+      else
+      {
+        rowText[row] = String ( rowPreset[row] == presetinfo.preset ? ">" : " " ) +
+                       String ( rowPreset[row] ) + " " + name ;
+      }
       rows[row] = rowText[row].c_str() ;
     }
-    bluetft_drawStationList ( rows, rowCount, middle ) ;
+    #ifdef SDCARD
+      if ( station_list_sd && savedSDIndex >= 0 && savedSDIndex < SD_filecount )
+      {
+        getSDFileName ( savedSDIndex ) ;                 // Browsing must not change current track
+        randomplay = savedRandomPlay ;
+      }
+    #endif
+    station_list_scroll_needed =
+      bluetft_drawStationList ( rows, rowCount, middle,
+                                station_list_scroll, selectedOnly ) ;
   #else
     String host, name ;
     readhostfrompref ( station_list_preset, &host, &name ) ;
@@ -1848,22 +2246,73 @@ void confirmStationNumber()
 void openStationList()
 {
   if ( !dsp_ok ) return ;
+  #ifdef SDCARD
+    SD_cover_visible = false ;                         // Any menu exits full-screen cover mode
+  #endif
+  station_list_sd = false ;
   station_number_entry = false ;
   station_number_input = "" ;
   station_list_preset = presetinfo.preset ;
   if ( !presetExists ( station_list_preset ) &&
        !findPreset ( 0, 1, 1, &station_list_preset ) ) return ;
   station_list_active = true ;
+  station_list_scroll = 0 ;
+  station_list_scroll_time = millis() ;
   drawStationList() ;
+}
+
+void openSDList()
+{
+  #ifdef SDCARD
+    if ( !dsp_ok ) return ;
+    SD_cover_visible = false ;                         // Any menu exits full-screen cover mode
+    if ( !SD_okay || SD_filecount <= 0 || !sdqueue )
+    {
+      ESP_LOGI ( TAG, "SD track list is not ready or is empty" ) ;
+      return ;
+    }
+    station_number_entry = false ;
+    station_number_input = "" ;
+    station_list_sd = true ;
+    station_list_sd_index = SD_curindex ;
+    if ( station_list_sd_index < 0 || station_list_sd_index >= SD_filecount )
+    {
+      station_list_sd_index = 0 ;
+    }
+    station_list_active = true ;
+    station_list_scroll = 0 ;
+    station_list_scroll_time = millis() ;
+    drawStationList() ;
+    ESP_LOGI ( TAG, "SD track list opened with %d entries", SD_filecount ) ;
+  #else
+    ESP_LOGI ( TAG, "SD support is disabled" ) ;
+  #endif
 }
 
 void moveStationList ( int8_t direction, uint8_t count )
 {
   if ( !station_list_active || !direction || !count ) return ;
+  #ifdef SDCARD
+    if ( station_list_sd )
+    {
+      if ( SD_filecount <= 0 ) return ;
+      int32_t next = station_list_sd_index + ( (int32_t)direction * count ) ;
+      if ( next < 0 ) next = 0 ;
+      if ( next >= SD_filecount ) next = SD_filecount - 1 ;
+      if ( next == station_list_sd_index ) return ;
+      station_list_sd_index = next ;
+      station_list_scroll = 0 ;
+      station_list_scroll_time = millis() ;
+      drawStationList() ;
+      return ;
+    }
+  #endif
   int16_t next = station_list_preset ;
   if ( findPreset ( station_list_preset, direction, count, &next ) )
   {
     station_list_preset = next ;
+    station_list_scroll = 0 ;
+    station_list_scroll_time = millis() ;
     drawStationList() ;
   }
 }
@@ -1875,6 +2324,23 @@ void confirmStationList()
     openStationList() ;
     return ;
   }
+  #ifdef SDCARD
+    if ( station_list_sd )
+    {
+      int16_t requested = station_list_sd_index ;
+      const char* path = getSDFileName ( requested ) ;
+      if ( path && *path )
+      {
+        String selectedPath = String ( path ) ;
+        restoreRadioView() ;
+        getSDFileName ( requested ) ;                     // Restore after display redraw activity
+        ESP_LOGI ( TAG, "SD list selected track %d: %s",
+                   requested + 1, selectedPath.c_str() ) ;
+        myQueueSend ( sdqueue, &startcmd ) ;
+      }
+      return ;
+    }
+  #endif
   int16_t requested = station_list_preset ;
   presetinfo.station_state = ST_PRESET ;
   if ( nextPreset ( requested ) )
@@ -2397,6 +2863,117 @@ void  scandigital()
 //**************************************************************************************************
 // See if IR input is available.  Execute the programmed command.                                  *
 //**************************************************************************************************
+struct IRDefault_t
+{
+  uint16_t    code ;
+  const char* command ;
+} ;
+
+static const IRDefault_t irConfigDefaults[] =
+{
+  { 0x02FD, "ok" },
+  { 0x4AB5, "preset = 0" },
+  { 0x6897, "preset = 1" },
+  { 0x9867, "preset = 2" },
+  { 0xB04F, "preset = 3" },
+  { 0x30CF, "preset = 4" },
+  { 0x18E7, "preset = 5" },
+  { 0x7A85, "preset = 6" },
+  { 0x10EF, "preset = 7" },
+  { 0x38C7, "preset = 8" },
+  { 0x5AA5, "preset = 9" },
+  { 0x22DD, "downpreset = 1" },
+  { 0xC23D, "uppreset = 1" },
+  { 0xA857, "downvolume = 2" },
+  { 0x629D, "upvolume = 2" },
+  { 0x42BD, "sdlist" }
+} ;
+
+static const uint8_t IR_CONFIG_VERSION = 3 ;
+
+// Copy the former built-in mappings to editable NVS preferences once.  The numeric version marker
+// is not shown by readprefs(), which intentionally lists string settings only.
+static bool migrateIRConfigToPreferences()
+{
+  uint8_t version = 0 ;
+  bool    changed = false ;
+  char    key[12] ;
+
+  nvsopen() ;
+  if ( nvs_get_u8 ( nvshandle, "ir_cfg_ver", &version ) == ESP_OK &&
+       version >= IR_CONFIG_VERSION )
+  {
+    return false ;                                      // Config is already authoritative
+  }
+
+  for ( const IRDefault_t& item : irConfigDefaults )
+  {
+    sprintf ( key, "ir_%04X", item.code ) ;
+    if ( !nvssearch ( key ) )                           // Preserve every existing custom mapping
+    {
+      nvssetstr ( key, String ( item.command ) ) ;
+      changed = true ;
+    }
+  }
+
+  if ( nvssearch ( "ir_02FD" ) )                       // Repair the old invalid OK assignment
+  {
+    String command = nvsgetstr ( "ir_02FD" ) ;
+    command.trim() ;
+    command.toLowerCase() ;
+    if ( command == "stop" )
+    {
+      nvssetstr ( "ir_02FD", String ( "ok" ) ) ;
+      changed = true ;
+    }
+  }
+  // V17 assigns the physical '*' key to the SD menu.  Replace the older numeric/default action
+  // once; after this migration a later user edit in Config remains authoritative.
+  if ( nvssearch ( "ir_42BD" ) )
+  {
+    String command = nvsgetstr ( "ir_42BD" ) ;
+    command.trim() ;
+    command.toLowerCase() ;
+    if ( command != "sdlist" )
+    {
+      nvssetstr ( "ir_42BD", String ( "sdlist" ) ) ;
+      changed = true ;
+    }
+  }
+  nvs_set_u8 ( nvshandle, "ir_cfg_ver", IR_CONFIG_VERSION ) ;
+  nvs_commit ( nvshandle ) ;
+  ESP_LOGI ( TAG, "IR mappings migrated to editable configuration" ) ;
+  return changed ;
+}
+
+#ifdef SDCARD
+static const uint8_t SD_CONFIG_VERSION = 1 ;
+
+// Install the confirmed V1 hardware setting once.  Later Config saves are authoritative, so the
+// user may change or remove pin_sd_cs without the firmware restoring it on every boot.
+static bool migrateSDConfigToPreferences()
+{
+  uint8_t version = 0 ;
+  bool    changed = false ;
+
+  nvsopen() ;
+  if ( nvs_get_u8 ( nvshandle, "sd_cfg_ver", &version ) == ESP_OK &&
+       version >= SD_CONFIG_VERSION )
+  {
+    return false ;
+  }
+  if ( !nvssearch ( "pin_sd_cs" ) )
+  {
+    nvssetstr ( "pin_sd_cs", String ( "21" ) ) ;        // Shared SPI, dedicated chip-select
+    changed = true ;
+  }
+  nvs_set_u8 ( nvshandle, "sd_cfg_ver", SD_CONFIG_VERSION ) ;
+  nvs_commit ( nvshandle ) ;
+  ESP_LOGI ( TAG, "SD configuration migrated: shared SPI, CS GPIO21" ) ;
+  return changed ;
+}
+#endif
+
 void scanIR()
 {
   char        mykey[20] ;                                   // For numerated key
@@ -2409,12 +2986,17 @@ void scanIR()
     if ( nvssearch ( mykey ) )
     {
       val = nvsgetstr ( mykey ) ;                           // Get the contents
-      #ifdef TOGGLEMUTE                                     // Special treat of mute commnad?
-        if ( val.equals ( "mute" ) && muteflag )            // Already muted?
-        {
-          val = String ( "unmute" ) ;                       // Yes, treat as "unmute"
-        }
-      #endif
+    }
+
+    if ( val.length() )
+    {
+      String normalizedCommand = val ;                       // Compare IR command reliably
+      normalizedCommand.trim() ;                            // Ignore whitespace from preferences
+      normalizedCommand.toLowerCase() ;                     // Commands are case-insensitive
+      if ( normalizedCommand == "mute" && muteflag )         // Same IR key pressed while muted?
+      {
+        val = String ( "unmute" ) ;                          // Toggle sound back on
+      }
       ESP_LOGI ( TAG, "IR code %04X received. Will execute %s",
                  ir_value, val.c_str() ) ;
       String ircommand = val ;
@@ -2433,8 +3015,44 @@ void scanIR()
       if ( irargument == "preset" && irparameter.length() == 1 &&
            isdigit ( irparameter[0] ) )
       {
-        enterStationDigit ( irparameter[0] - '0' ) ;       // Numeric remote entry
-        reply = "Preset digit accepted" ;
+        #ifdef SDCARD
+          const uint8_t digit = irparameter[0] - '0' ;
+          if ( SD_playing && !station_list_active )
+          {
+            int16_t seconds = 0 ;
+            if      ( digit == 1 ) seconds = -5 ;
+            else if ( digit == 3 ) seconds =  5 ;
+            else if ( digit == 4 ) seconds = -10 ;
+            else if ( digit == 6 ) seconds =  10 ;
+            else if ( digit == 7 ) seconds = -30 ;
+            else if ( digit == 9 ) seconds =  30 ;
+            if ( seconds )
+            {
+              if ( SD_cover_visible )
+              {
+                SD_cover_visible = false ;
+                restoreRadioView() ;
+              }
+              SD_seek_seconds += seconds ;              // sdfuncs performs the safe frame-aligned seek
+              reply = seconds > 0 ? "MP3 seek forward" : "MP3 seek backward" ;
+            }
+            #if defined(BLUETFT)
+              else if ( digit == 0 )
+              {
+                reply = toggleSDCover() ? "MP3 cover shown" : "MP3 cover unavailable/closed" ;
+              }
+            #endif
+            else
+            {
+              reply = "MP3 digit has no action" ;
+            }
+          }
+          else
+        #endif
+        {
+          enterStationDigit ( irparameter[0] - '0' ) ;   // Numeric station entry outside MP3 mode
+          reply = "Preset digit accepted" ;
+        }
       }
       else
       {
@@ -2456,9 +3074,8 @@ void scanIR()
 //**************************************************************************************************
 //                                           M K _ L S A N                                         *
 //**************************************************************************************************
-// Make al list of all WiFi networks in preferences and FIXEDWIFI.                                 *
-// Will be called only once by setup().                                                            *
-// The networks will be added to wifiMulti.                                                        *
+// Make a list of all WiFi networks in preferences and FIXEDWIFI.                                  *
+// Will be called only once by setup().  Credentials are retained for direct, diagnosed retries.   *
 //**************************************************************************************************
 void  mk_lsan()
 {
@@ -2470,6 +3087,7 @@ void  mk_lsan()
   WifiInfo_t  winfo ;                                    // Element to store in list
 
   ESP_LOGI ( TAG, "Create list with acceptable WiFi networks" ) ;
+  wifilist.clear() ;
   for ( i = -1 ; i < 100 ; i++ )                         // Examine FIXEDWIFI, wifi_00 .. wifi_99
   {
     buf = String ( "" ) ;                                // Clear buffer with ssid/passwd
@@ -2493,10 +3111,14 @@ void  mk_lsan()
     {
       lpw = buf.substring ( inx + 1 ) ;                  // Isolate password
       lssid = buf.substring ( 0, inx ) ;                 // Holds SSID now
-      wifiMulti.addAP ( lssid.c_str(),                   // Add to wifi acceptable network list
-                        lpw.c_str() ) ;
+      winfo.ssid = lssid ;
+      winfo.passphrase = lpw ;
+      wifilist.push_back ( winfo ) ;                     // Retain credentials for direct retries
+      ESP_LOGI ( TAG, "WiFi candidate %u: '%s'",
+                 (unsigned)wifilist.size(), lssid.c_str() ) ;
     }
   }
+  ESP_LOGI ( TAG, "%u configured WiFi network(s)", (unsigned)wifilist.size() ) ;
 }
 #endif
 
@@ -2611,12 +3233,14 @@ void fillkeylist()
 //**************************************************************************************************
 void handleData ( void* arg, AsyncClient* client, void *data, size_t len )
 {
+  if ( stream_redirect_request ) return ;               // A replacement connection is already queued
   uint8_t* p = (uint8_t*)data ;                         // Treat as an array of bytes
 
   // ESP_LOGI ( TAG, "Data received, %d bytes", len ) ;
   while ( len-- )
   {
     handlebyte_ch ( *p++ ) ;                            // Handle next byte
+    if ( stream_redirect_request ) break ;              // Ignore the redirect response body
   }
 }
 
@@ -2684,7 +3308,6 @@ void setup()
 
   maintask = xTaskGetCurrentTaskHandle() ;                // My taskhandle
   outchunk.datatyp = QDATA ;                              // This chunk dedicated to QDATA
-  vTaskDelay ( 3000 / portTICK_PERIOD_MS ) ;              // Wait for PlatformIO monitor to start
   Serial.begin ( 115200 ) ;                               // For debug
   WRITE_PERI_REG ( RTC_CNTL_BROWN_OUT_REG, 0 ) ;          // Disable brownout detector
   log_printf ( "\n" ) ;
@@ -2695,6 +3318,7 @@ void setup()
   ESP_LOGI ( TAG, "Version %s.  Free memory %d",
              VERSION,
              heapspace ) ;                                // Normally about 100 kB
+  ESP_LOGI ( TAG, "BUILD IR-STATIONS-SD-V21-20260914" ) ; // MP3 L/R tracks and larger counter
   ESP_LOGI ( TAG, "Display type is %s", DISPLAYTYPE ) ;   // Report display option
   
   if ( !SPIFFS.begin ( FSIF ) )                           // Mount and test SPIFFS
@@ -2742,6 +3366,16 @@ void setup()
     while ( true ) ;                                     // Impossible to continue
   }
   fillkeylist() ;                                        // Fill keynames with all keys
+  if ( migrateIRConfigToPreferences() )                  // One-time move of IR map into Config
+  {
+    fillkeylist() ;                                      // Include the migrated ir_XXXX keys
+  }
+  #ifdef SDCARD
+    if ( migrateSDConfigToPreferences() )                // Install confirmed shared-SPI CS pin
+    {
+      fillkeylist() ;                                    // Include pin_sd_cs in Config
+    }
+  #endif
   memset ( &ini_block, 0, sizeof(ini_block) ) ;          // Init ini_block
   ini_block.mqttport = 1883 ;                            // Default port for MQTT
   ini_block.mqttprefix = "" ;                            // No prefix for MQTT topics seen yet
@@ -2752,6 +3386,13 @@ void setup()
   ini_block.bat100 = 2950 ;                              // Battery ADC level for 100 percent
   readIOprefs() ;                                        // Read pins used for SPI, TFT, VS1053, IR,
                                                          // Rotary encoder
+  #ifdef SDCARD
+    if ( ini_block.sd_cs_pin >= 0 )                      // Keep shared-bus SD inactive during boot
+    {
+      pinMode ( ini_block.sd_cs_pin, OUTPUT ) ;
+      digitalWrite ( ini_block.sd_cs_pin, HIGH ) ;
+    }
+  #endif
   for ( i = 0 ; (pinnr = progpin[i].gpio) >= 0 ; i++ )   // Check programmable input pins
   {
     pinMode ( pinnr, INPUT_PULLUP ) ;                    // Input for control button
@@ -2943,7 +3584,18 @@ void setup()
     2,                                                    // priority of the task
     &xplaytask,                                           // Task handle to keep track of created task
     0 ) ;                                                 // Run on CPU 0
-  vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;               // Allow playtask to start
+  #if defined(DEC_VS1053) || defined(DEC_VS1003)
+    for ( uint8_t wait = 0 ; !player_init_done && wait < 30 ; wait++ )
+    {
+      vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;           // Never start SD/radio during decoder test
+    }
+    if ( !player_ready )
+    {
+      ESP_LOGE ( TAG, "VS1003 initialization failed or timed out" ) ;
+    }
+  #else
+    vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;             // Allow software decoder task to start
+  #endif
 #ifdef SDCARD
   sdqueue = xQueueCreate ( 10,                            // Create small queue for communication to sdfuncs
                            sizeof ( qdata_type ) ) ;
@@ -3012,6 +3664,11 @@ void writeprefs ( AsyncWebServerRequest *request )
                key.c_str(), contents.c_str() ) ;  // Toon POST parameter
     nvssetstr ( key.c_str(), contents ) ;         // Save new pair
   }
+  // A saved Config is authoritative, including intentionally removed IR mappings.
+  nvs_set_u8 ( nvshandle, "ir_cfg_ver", IR_CONFIG_VERSION ) ;
+  #ifdef SDCARD
+    nvs_set_u8 ( nvshandle, "sd_cfg_ver", SD_CONFIG_VERSION ) ;
+  #endif
   nvs_commit( nvshandle ) ;
   //timerAlarmEnable ( timer ) ;                  // Enable the timer
   fillkeylist() ;                                 // Update list with keys
@@ -3108,7 +3765,7 @@ void handle_getprefs ( AsyncWebServerRequest *request )
   //  setdatamode (  STOPREQD ) ;                      // Stop playing
   //}
   prefs = readprefs ( true ) ;                         // Read preference values
-  request->send ( 200, "text/plain", prefs ) ;         // Send the reply
+  request->send ( 200, "text/plain; charset=utf-8", prefs ) ; // Preserve Unicode in browser
 }
 
 
@@ -3122,7 +3779,7 @@ void handle_saveprefs ( AsyncWebServerRequest *request )
   const char* reply = "Config saved" ;                 // Default reply
 
   writeprefs ( request ) ;                             // Write to NVS
-  request->send ( 200, "text/plain", reply ) ;         // Send the reply
+  request->send ( 200, "text/plain; charset=utf-8", reply ) ; // UTF-8 configuration response
 }
 
 
@@ -3139,7 +3796,7 @@ void handle_getdefs ( AsyncWebServerRequest *request )
   path = "/defaultprefs.txt" ;                        // Set file name
   if ( SPIFFS.exists ( path ) )                       // Does it exist in SPIFFS?
   {
-    ct = getContentType ( path ) ;                    // Yes, get content type
+    ct = "text/plain; charset=utf-8" ;               // Default preferences contain Unicode
     request->send ( SPIFFS, path, ct ) ;              // Send to client
   }
   else
@@ -3457,6 +4114,97 @@ void chk_enc()
   rotationcount = 0 ;                                         // Reset
 }
 
+
+//**************************************************************************************************
+//                              D I S P L A Y   S D   P R O G R E S S                              *
+//**************************************************************************************************
+// Update the played/length counter and the divider between artist and title once per second.      *
+//**************************************************************************************************
+static void displaySDProgress()
+{
+  #if defined(SDCARD) && defined(BLUETFT)
+    if ( !SD_playing || SD_cover_visible || station_list_active || !dsp_ok ) return ;
+    uint32_t playedSeconds, lengthSeconds ;
+    uint8_t percent ;
+    getSDProgress ( playedSeconds, lengthSeconds, percent ) ;
+    String progressText = getSDProgressText() ;
+    displayplaytime ( progressText.c_str() ) ;
+    const int16_t y = tftdata[2].y - 2 ;
+    const int16_t filled = ( dsp_getwidth() * percent ) / 100 ;
+    dsp_fillRect ( 0, y, filled, 2, GREEN ) ;
+    dsp_fillRect ( filled, y, dsp_getwidth() - filled, 2, GREY ) ;
+  #endif
+}
+
+
+#if defined(SDCARD) && defined(BLUETFT)
+// TJpg_Decoder callback for the Adafruit_GFX-compatible ST7735 driver.
+static bool drawSDCoverBlock ( int16_t x, int16_t y, uint16_t width,
+                               uint16_t height, uint16_t* pixels )
+{
+  if ( !bluetft_tft || y >= dsp_getheight() ) return false ;
+  bluetft_tft->drawRGBBitmap ( x, y, pixels, width, height ) ;
+  return true ;
+}
+
+
+// Toggle a JPEG stored in the current track's ID3 APIC frame.  A separate File handle preserves
+// the playback position; the decoder stops at JPEG EOI, so trailing MP3 audio is never rendered.
+static bool toggleSDCover()
+{
+  if ( !SD_playing || !dsp_ok ) return false ;
+  if ( SD_cover_visible )
+  {
+    SD_cover_visible = false ;
+    restoreRadioView() ;
+    return false ;
+  }
+  if ( !SD_cover_offset || !SD_cover_length )
+  {
+    ESP_LOGI ( TAG, "Current MP3 has no supported embedded JPEG cover" ) ;
+    return false ;
+  }
+
+  String path = String ( getCurrentSDFileName() ) ;
+  uint16_t imageWidth = 0, imageHeight = 0 ;
+  File coverInfo = SD.open ( path, FILE_READ ) ;
+  if ( !coverInfo || !coverInfo.seek ( SD_cover_offset ) ||
+       TJpgDec.getFsJpgSize ( &imageWidth, &imageHeight, coverInfo ) != JDR_OK )
+  {
+    if ( coverInfo ) coverInfo.close() ;
+    ESP_LOGI ( TAG, "Cannot read embedded JPEG cover" ) ;
+    return false ;
+  }
+  if ( coverInfo ) coverInfo.close() ;
+
+  uint8_t scale = 1 ;
+  while ( scale < 8 &&
+          ( ( imageWidth + scale - 1 ) / scale > dsp_getwidth() ||
+            ( imageHeight + scale - 1 ) / scale > dsp_getheight() ) ) scale *= 2 ;
+  uint16_t shownWidth = ( imageWidth + scale - 1 ) / scale ;
+  uint16_t shownHeight = ( imageHeight + scale - 1 ) / scale ;
+  int16_t x = shownWidth < dsp_getwidth() ? ( dsp_getwidth() - shownWidth ) / 2 : 0 ;
+  int16_t y = shownHeight < dsp_getheight() ? ( dsp_getheight() - shownHeight ) / 2 : 0 ;
+
+  File cover = SD.open ( path, FILE_READ ) ;
+  if ( !cover || !cover.seek ( SD_cover_offset ) )
+  {
+    if ( cover ) cover.close() ;
+    return false ;
+  }
+  dsp_erase() ;
+  TJpgDec.setJpgScale ( scale ) ;
+  TJpgDec.setCallback ( drawSDCoverBlock ) ;
+  JRESULT result = TJpgDec.drawFsJpg ( x, y, cover ) ;
+  if ( cover ) cover.close() ;
+  SD_cover_visible = result == JDR_OK ;
+  if ( !SD_cover_visible ) restoreRadioView() ;
+  ESP_LOGI ( TAG, "Embedded cover render result %d, %ux%u, scale %u",
+             result, imageWidth, imageHeight, scale ) ;
+  return SD_cover_visible ;
+}
+#endif
+
 //**************************************************************************************************
 //                                     S P F U N C S                                               *
 //**************************************************************************************************
@@ -3475,7 +4223,23 @@ void spfuncs()
     }
     if ( dsp_ok )                                               // Posible to update TFT?
     {
-      if ( !station_list_active )                               // List owns the whole display
+      if ( station_list_active )                                // Animate selected long list title
+      {
+        if ( station_list_scroll_needed &&
+             millis() - station_list_scroll_time >= 300 )
+        {
+          station_list_scroll_time = millis() ;
+          station_list_scroll++ ;
+          drawStationList ( true ) ;                            // Redraw only the selected row
+        }
+      }
+      #ifdef SDCARD
+        else if ( SD_cover_visible )                            // Keep cover intact while audio continues
+        {
+          // Pending text updates remain queued and are painted after key 0/menu/track change.
+        }
+      #endif
+      else                                                      // Normal radio screen
       {
         for ( uint16_t i = 0 ; i < TFTSECS ; i++ )              // Yes, handle all sections
         {
@@ -3510,12 +4274,17 @@ void spfuncs()
         gettime() ;                                             // Yes, get the current time
       }
       time_req = false ;                                        // Yes, clear request
-      if ( !station_list_active )
+      if ( !station_list_active
+           #ifdef SDCARD
+             && !SD_cover_visible
+           #endif
+         )
       {
         displaytime ( timetxt ) ;                               // Write to TFT screen
         displayvolume ( player_getVolume() ) ;                  // Show volume on display
         displaybattery ( ini_block.bat0, ini_block.bat100,      // Show battery charge on display
                          adcval ) ;
+        displaySDProgress() ;                                   // SD counter and progress divider
       }
     }
     if ( mqtt_on )
@@ -3614,6 +4383,7 @@ void loop()
   handleIpPub() ;                                   // See if time to publish IP
   handleVolPub() ;                                  // See if time to publish volume
   chk_enc() ;                                       // Check rotary encoder functions
+  pump_secure_stream() ;                            // Feed HTTPS data into the common stream parser
   radiofuncs() ;                                    // Handle start/stop commands for icecast
   spfuncs() ;                                       // Handle special functions
   sdfuncs() ;                                       // Do SD card related functions
@@ -3738,7 +4508,6 @@ void handlebyte_ch ( uint8_t b )
   static uint16_t  playlistcnt ;                        // Counter to find right entry in playlist
   static int       LFcount ;                            // Detection of end of header
   static bool      ctseen = false ;                     // First line of header seen or not
-  static bool      redirection = false ;                // Redirection or not
 
   if ( chunked &&
        ( datamode & ( DATA |                            // Test op DATA handling
@@ -3770,17 +4539,20 @@ void handlebyte_ch ( uint8_t b )
   }
   if ( datamode == DATA )                               // Handle next byte of MP3/AAC/Ogg data
   {
-    *outqp++ = b ;
-    if ( outqp == ( outchunk.buf + sizeof(outchunk.buf) ) )       // Buffer full?
+    if ( !ad_suppression_active )                       // Do not feed detected advertisements
     {
-      // Send data to playtask queue.  If the buffer cannot be placed within 200 ticks,
-      // the queue is full, while the sender tries to send more.  The chunk will be dis-
-      // carded it that case.
-      if ( xQueueSend ( dataqueue, &outchunk, 200 ) != pdTRUE )  // Send to queue
+      *outqp++ = b ;
+      if ( outqp == ( outchunk.buf + sizeof(outchunk.buf) ) )     // Buffer full?
       {
-        ESP_LOGE ( TAG, "MP3 packet dropped!" ) ;
+        // Send data to playtask queue.  If the buffer cannot be placed within 200 ticks,
+        // the queue is full, while the sender tries to send more.  The chunk will be dis-
+        // carded it that case.
+        if ( xQueueSend ( dataqueue, &outchunk, 200 ) != pdTRUE ) // Send to queue
+        {
+          ESP_LOGE ( TAG, "MP3 packet dropped!" ) ;
+        }
+        outqp = outchunk.buf ;                          // Item empty now
       }
-      outqp = outchunk.buf ;                            // Item empty now
     }
     if ( metaint )                                      // No METADATA on Ogg streams or mp3 files
     {
@@ -3795,7 +4567,6 @@ void handlebyte_ch ( uint8_t b )
   if ( datamode == INIT )                               // Initialize for header receive
   {
     ctseen = false ;                                    // Contents type not seen yet
-    redirection = false ;                               // No redirection found yet
     outqp = outchunk.buf ;                              // Item empty now
     metaint = 0 ;                                       // No metaint found
     stream_charset = "" ;                               // No charset announced yet
@@ -3826,17 +4597,21 @@ void handlebyte_ch ( uint8_t b )
         String metaline = String ( metalinebf ) ;       // Convert to string
         String lcml = metaline ;                        // Use lower case for compare
         lcml.toLowerCase() ;
-        if ( lcml.startsWith ( "location: " ) )         // Redirection?
+        if ( lcml.startsWith ( "location:" ) )          // Redirection?
         {
-          metaline = metaline.substring ( 10 ) ;        // Yes, get new URL
-          int hp = metaline.indexOf ( "://" ) ;         // Redirection with "http(s)://" ?
-          if ( hp > 0 )
+          String location = metaline.substring ( 9 ) ;  // Accept Location:URL and Location: URL
+          location.trim() ;
+          if ( begin_stream_redirect ( location ) )
           {
-            metaline = metaline.substring ( hp + 3 ) ;  // Yes, get new URL
+            setdatamode ( INIT ) ;
+            myQueueSend ( radioqueue, &startcmd ) ;
           }
-          presetinfo.station_state = ST_REDIRECT ;      // Set host already filled
-          presetinfo.host= metaline ;
-          redirection = true ;                          // Remember redirection
+          else
+          {
+            setdatamode ( STOPREQD ) ;
+            myQueueSend ( radioqueue, &stopcmd ) ;
+          }
+          return ;                                      // Never parse a redirect response body
         }
         if ( lcml.startsWith ( "content-type" ) )       // Line with "Content-Type: xxxx/yyy"
         {
@@ -3889,13 +4664,7 @@ void handlebyte_ch ( uint8_t b )
       metalinebfx = 0 ;                                 // Reset this line
       if ( LFcount == 2 )                               // Double LF marks end of header?
       {
-        if ( redirection )                              // Redirection?
-        {
-          ESP_LOGI ( TAG, "Redirect" ) ;                // Yes, show
-          setdatamode ( INIT ) ;                        // Mode to INIT again
-          myQueueSend ( radioqueue, &startcmd ) ;       // Restart with new found host
-        }
-        else if ( ctseen )                              // Content type seen?
+        if ( ctseen )                                   // Content type seen?
         {
           icyname = decode_spec_chars ( decodeStreamText ( icyname_raw,
                                                            stream_charset ) ) ;
@@ -3947,10 +4716,41 @@ void handlebyte_ch ( uint8_t b )
         // "StreamTitle='Don McLean - American Pie';StreamUrl='';"
         // Sometimes it is just other info like:
         // "StreamTitle='60s 03 05 Magic60s';StreamUrl='';"
-        // Isolate the StreamTitle, remove leading and trailing quotes if present.
-        if ( showstreamtitle ( metalinebf ) )           // Show artist and title if present in metadata
+        // Detect ads before showstreamtitle(), which intentionally stops parsing at the first
+        // semicolon and would therefore hide advertisement fields such as StreamUrl.
+        if ( isAdvertisementMetadata ( metalinebf ) )
         {
-          mqttpub.trigger ( MQTT_STREAMTITLE ) ;        // Title changed: Request publishing to MQTT
+          ESP_LOGI ( TAG, "Advertisement metadata detected: %s", metalinebf ) ;
+          icystreamtitle = "" ;                        // Do not publish or display the advertiser title
+          oldstreamtitle = "" ;
+          tftset ( 1, "" ) ;                           // Remove the advertiser title from the display
+          mqttpub.trigger ( MQTT_STREAMTITLE ) ;
+          if ( !ad_suppression_active )
+          {
+            ad_suppression_active = true ;             // Continue parsing, but discard audio bytes
+            outqp = outchunk.buf ;                      // Drop a partially collected audio packet
+            queueToPt ( QSTOPSONG ) ;                  // Empty queued ad audio and mute the decoder
+            ESP_LOGI ( TAG, "Advertisement audio suppressed until normal metadata" ) ;
+          }
+          else
+          {
+            ESP_LOGI ( TAG, "Advertisement suppression remains active" ) ;
+          }
+        }
+        else
+        {
+          if ( ad_suppression_active )
+          {
+            ad_suppression_active = false ;            // Music metadata marks the end of the ad
+            outqp = outchunk.buf ;                      // Resume on a clean 32-byte packet
+            queueToPt ( QSTARTSONG ) ;
+            ESP_LOGI ( TAG, "Normal metadata received, audio resumed" ) ;
+          }
+          // Isolate the StreamTitle, remove leading and trailing quotes if present.
+          if ( showstreamtitle ( metalinebf ) )         // Show artist and title if present
+          {
+            mqttpub.trigger ( MQTT_STREAMTITLE ) ;      // Title change: publish through MQTT
+          }
         }
       }
       if ( metalinebfx  > ( METASIZ - 10 ) )            // Unlikely metaline length?
@@ -3994,6 +4794,22 @@ void handlebyte_ch ( uint8_t b )
       String playlistheader = String ( metalinebf ) ;
       String lcplaylistheader = playlistheader ;
       lcplaylistheader.toLowerCase() ;
+      if ( lcplaylistheader.startsWith ( "location:" ) )
+      {
+        String location = playlistheader.substring ( 9 ) ;
+        location.trim() ;
+        if ( begin_stream_redirect ( location ) )
+        {
+          setdatamode ( INIT ) ;
+          myQueueSend ( radioqueue, &startcmd ) ;
+        }
+        else
+        {
+          setdatamode ( STOPREQD ) ;
+          myQueueSend ( radioqueue, &stopcmd ) ;
+        }
+        return ;                                      // Do not parse the redirect response body
+      }
       int cp = lcplaylistheader.indexOf ( "charset=" ) ;
       if ( cp >= 0 )
       {
@@ -4081,12 +4897,7 @@ void handlebyte_ch ( uint8_t b )
       ESP_LOGI ( TAG, "Entry %d in playlist found: %s", playlistcnt, metalinebf ) ;
       if ( presetinfo.playlistnr == playlistcnt )       // Is it the right one?
       {
-        inx = metaline.indexOf ( "://" ) ;              // Search for "http(s)://"
-        if ( inx >= 0 )                                 // Does URL contain "http://"?
-        {
-          metaline = metaline.substring ( inx + 3 ) ;   // Yes, remove it
-        }
-        presetinfo.host = metaline ;                    // Set host
+        presetinfo.host = metaline ;                    // Keep http:// or https:// for transport choice
         presetinfo.hsym = metaline ;                    // Do not know symbolic name
         presetinfo.station_state = ST_PLAYLIST ;        // Set playlist mode
         setdatamode ( INIT ) ;                          // Yes, mode to INIT again
@@ -4295,29 +5106,70 @@ const char* analyzeCmd ( const char* par, const char* val )
     strcpy ( reply, "Station selection OK" ) ;
     return reply ;
   }
+  if ( argument == "sdlist" )                        // Open SD track browser
+  {
+    if ( station_list_active )
+    {
+      restoreRadioView() ;
+      strcpy ( reply, "Menu closed" ) ;
+    }
+    else
+    {
+      openSDList() ;
+      strcpy ( reply, "SD track list" ) ;
+    }
+    return reply ;
+  }
   if ( station_list_active )                          // Arrow keys navigate the station list
   {
     if ( argument == "up" || argument == "uppreset" )
     {
-      moveStationList ( -1, 1 ) ;
+      moveStationList ( 1, 7 ) ;                     // U takes the former R/page-forward function
       return reply ;
     }
     if ( argument == "down" || argument == "downpreset" )
     {
-      moveStationList ( 1, 1 ) ;
+      moveStationList ( -1, 7 ) ;                    // D takes the former L/page-back function
       return reply ;
     }
     if ( argument == "left" || argument == "downvolume" )
     {
-      moveStationList ( -1, 7 ) ;
+      moveStationList ( 1, 1 ) ;                     // L takes the former D/next-row function
       return reply ;
     }
     if ( argument == "right" || argument == "upvolume" )
     {
-      moveStationList ( 1, 7 ) ;
+      moveStationList ( -1, 1 ) ;                    // R takes the former U/previous-row function
       return reply ;
     }
   }
+  #ifdef SDCARD
+    if ( SD_playing &&
+         ( argument == "left" || argument == "downpreset" ||
+           argument == "right" || argument == "uppreset" ) )
+    {
+      const int16_t direction = ( argument == "left" || argument == "downpreset" ) ? -1 : 1 ;
+      int16_t next = SD_curindex + direction ;
+      if ( next < 0 ) next = SD_filecount - 1 ;
+      else if ( next >= SD_filecount ) next = 0 ;
+      if ( SD_filecount > 0 )
+      {
+        if ( SD_cover_visible )
+        {
+          SD_cover_visible = false ;
+          restoreRadioView() ;
+        }
+        getSDFileName ( next ) ;
+        myQueueSend ( sdqueue, &startcmd ) ;
+        strcpy ( reply, direction > 0 ? "MP3 next track" : "MP3 previous track" ) ;
+      }
+      else
+      {
+        strcpy ( reply, "No MP3 tracks" ) ;
+      }
+      return reply ;
+    }
+  #endif
   if ( ( relative = argument.startsWith ( "up" ) ) )  // + relative setting?
   {
     argument = argument.substring ( 2 ) ;             // Remove the "up"-part
@@ -4559,15 +5411,27 @@ void displayinfo ( uint16_t inx )
   {
     width += TIMEPOS ;                                     // Leave space for time
   }
-  #ifdef BLUETFT
-    if ( inx == 2 ) width -= STATIONNUMWIDTH ;             // Leave room for preset number
+    #ifdef BLUETFT
+      #ifdef SDCARD
+      if ( inx == 2 ) width -= ( SD_playing ? TRACKNUMWIDTH : STATIONNUMWIDTH ) ;
+      #else
+      if ( inx == 2 ) width -= STATIONNUMWIDTH ;           // Leave room for preset number
+    #endif
   #endif
   if ( dsp_ok )                                            // TFT active?
   {
     dsp_fillRect ( 0, p->y, width, p->height, BLACK ) ;    // Clear the space for new info
     if ( ( dsp_getheight() > 64 ) && ( p->y > 1 ) )        // Need and space for divider?
     {
-      dsp_fillRect ( 0, p->y - 4, width, 1, GREEN ) ;      // Yes, show divider above text
+      #ifdef BLUETFT
+        dsp_fillRect ( 0, p->y - 2, dsp_getwidth(), 2, GREEN ) ; // Keep divider outside text
+        if ( inx == 1 )
+        {
+          displaybattery ( ini_block.bat0, ini_block.bat100, adcval ) ; // Restore battery bar now
+        }
+      #else
+        dsp_fillRect ( 0, p->y - 4, width, 1, GREEN ) ;    // Legacy display position
+      #endif
     }
     len = p->str.length() ;                                // Required length of buffer
     if ( len++ )                                           // Check string length, set buffer length
@@ -4591,10 +5455,21 @@ void displayinfo ( uint16_t inx )
     #ifdef BLUETFT
       if ( inx == 2 )
       {
-        String stationNumber = station_number_entry ? station_number_input :
-                               String ( presetinfo.preset ) ;
-        bluetft_drawStationNumber ( stationNumber.c_str(),
-                                    station_number_entry ? MAGENTA : p->color ) ;
+        #ifdef SDCARD
+          if ( SD_playing )
+          {
+            String trackNumber = String ( SD_curindex + 1 ) + "/" + String ( SD_filecount ) ;
+            bluetft_drawTrackNumber ( trackNumber.c_str(), p->color ) ;
+            displaySDProgress() ;                          // Restore progress after title redraw
+          }
+          else
+        #endif
+        {
+          String stationNumber = station_number_entry ? station_number_input :
+                                 String ( presetinfo.preset ) ;
+          bluetft_drawStationNumber ( stationNumber.c_str(),
+                                      station_number_entry ? MAGENTA : p->color ) ;
+        }
       }
     #endif
   }
@@ -4644,70 +5519,109 @@ void gettime()
 #if defined(DEC_VS1053) || defined(DEC_VS1003)
 
 //**************************************************************************************************
-//                         P L A Y T A S K  ( V S 1 0 5 3 )                                        *
+//                         P L A Y T A S K  ( V S 1 0 X 3 )                                        *
 //**************************************************************************************************
-// Play stream data from input queue. Version for VS1053.                                          *
-// Handle all I/O to VS1053B during normal playing.                                                *
+// Play stream data from input queue. Version for VS1003/VS1053.                                   *
+// Handle all I/O to the hardware decoder during normal playing.                                  *
 //**************************************************************************************************
 void playtask ( void * parameter )
 {
   // static bool once = true ;                                      // Show chunk once  #if defined(DEC_VS1053) || defined(DEC_VS1003)
-  bool VS_okay ;                                                    // VS isw okay or not
+  bool VS_okay ;                                                    // VS is okay or not
+  uint32_t lastRecovery = 0 ;                                       // Avoid recovery storm on a hard fault
+  uint8_t audioChunksBeforeYield = 0 ;                              // Keep IDLE0 alive while queue stays full
 
-  ESP_LOGI ( TAG, "Starting VS1053 playtask.." ) ;
+  ESP_LOGI ( TAG, "Starting VS1003 playtask.." ) ;
   VS_okay = VS1053_begin ( ini_block.vs_cs_pin,                     // Make instance of player and initialize
                            ini_block.vs_dcs_pin,
                            ini_block.vs_dreq_pin,
                            ini_block.shutdown_pin,
                            ini_block.shutdownx_pin ) ;
+  player_ready = VS_okay ;
+  player_init_done = true ;
+  ESP_LOGI ( TAG, "VS1003 initialization %s", VS_okay ? "ready" : "failed" ) ;
   while ( true )
   {
     if ( xQueueReceive ( dataqueue, &inchunk, 5 ) == pdTRUE )       // Command/data from queue?
     {
-      if ( VS_okay )
+      switch ( inchunk.datatyp )
       {
-        switch ( inchunk.datatyp )                                    // What kind of command?
-        {
-          case QDATA:
-            while ( !vs1053player->data_request() )                   // If hardware FIFO is full..
+        case QDATA:
+          if ( VS_okay )
+          {
+            if ( !vs1053player->playChunk ( inchunk.buf,              // Bounded DREQ wait in driver
+                                             sizeof(inchunk.buf) ) )
             {
-              vTaskDelay ( 1 ) ;                                      // Yes, take a break
+              VS_okay = false ;
+              player_ready = VS_okay ;
+              uint32_t now = millis() ;
+              if ( lastRecovery == 0 || now - lastRecovery >= 5000 )
+              {
+                lastRecovery = now ;
+                ESP_LOGE ( TAG, "VS1003 stopped accepting audio, trying recovery" ) ;
+                VS_okay = vs1053player->recover() ;
+                player_ready = VS_okay ;
+                if ( VS_okay )
+                {
+                  vs1053player->setVolume ( ini_block.reqvol ) ;
+                  vs1053player->startSong() ;
+                }
+              }
             }
-            // if ( once )                                            // Show this chunk?
-            // {
-            //   Serial.printf ( "First chunk to play (HEX):" ) ;     // Yes, show for testing purpose
-            //   for ( int i = 0 ; i < 32 ; i++ )
-            //   {
-            //     Serial.printf ( " %02X", inchunk.buf[i] ) ; 
-            //   }
-            //   Serial.printf ( "\n" ) ;
-            //   once = false ;                                       // Just show once
-            // }
-            vs1053player->playChunk ( inchunk.buf,                    // DATA, send to player
-                                      sizeof(inchunk.buf) ) ;
             totalcount += sizeof(inchunk.buf) ;                       // Count the bytes
-            break ;
-          case QSTARTSONG:
-            ESP_LOGI ( TAG, "QSTARTSONG" ) ;
+          }
+          else
+          {
+            uint32_t now = millis() ;
+            if ( lastRecovery == 0 || now - lastRecovery >= 5000 )
+            {
+              lastRecovery = now ;
+              ESP_LOGW ( TAG, "Retrying VS1003 recovery while stream data is available" ) ;
+              VS_okay = vs1053player->recover() ;
+              player_ready = VS_okay ;
+              if ( VS_okay )
+              {
+                vs1053player->setVolume ( ini_block.reqvol ) ;
+                vs1053player->startSong() ;
+              }
+            }
+          }
+          break ;
+        case QSTARTSONG:
+          if ( !VS_okay )
+          {
+            VS_okay = vs1053player->recover() ;                       // Retry on each new stream/track
+            player_ready = VS_okay ;
+          }
+          if ( VS_okay )
+          {
+            ESP_LOGI ( TAG, "QSTARTSONG, VS1003 volume %u", ini_block.reqvol ) ;
             playingstat = 1 ;                                         // Status for MQTT
             mqttpub.trigger ( MQTT_PLAYING ) ;                        // Request publishing to MQTT
             vs1053player->setVolume ( ini_block.reqvol ) ;            // Unmute
             vs1053player->startSong() ;                               // START, start player
-            // once = true ;
-            break ;
-          case QSTOPSONG:
+          }
+          break ;
+        case QSTOPSONG:
+          if ( VS_okay )
+          {
             ESP_LOGI ( TAG, "QSTOPSONG" ) ;
             playingstat = 0 ;                                         // Status for MQTT
             mqttpub.trigger ( MQTT_PLAYING ) ;                        // Request publishing to MQTT
             vs1053player->setVolume ( 0 ) ;                           // Mute
             vs1053player->stopSong() ;                                // STOP, stop player
-            break ;
-          case QSTOPTASK:
-            vTaskDelete ( NULL ) ;                                    // Stop task
-            break ;
-          default:
-            break ;
-        }
+          }
+          break ;
+        case QSTOPTASK:
+          vTaskDelete ( NULL ) ;                                      // Stop task
+          break ;
+        default:
+          break ;
+      }
+      if ( inchunk.datatyp == QDATA && ++audioChunksBeforeYield >= 8 )
+      {
+        audioChunksBeforeYield = 0 ;
+        vTaskDelay ( 1 ) ;                                           // Feed CPU0 idle/watchdog every 256 bytes
       }
     }
   }
@@ -4876,6 +5790,55 @@ void playtask ( void * parameter )
 // Handles data of SD card and commands in the sdqueue.                                            *
 // Commands are received in the input queue.                                                       *
 //**************************************************************************************************
+#ifdef SDCARD
+static bool performSDSeek ( int16_t relativeSeconds )
+{
+  uint32_t playedSeconds, lengthSeconds ;
+  uint8_t percent ;
+  getSDProgress ( playedSeconds, lengthSeconds, percent ) ;
+  if ( !SD_playing || !SD_totalbytes || !lengthSeconds ) return false ;
+
+  int32_t targetSeconds = (int32_t)playedSeconds + relativeSeconds ;
+  if ( targetSeconds < 0 ) targetSeconds = 0 ;
+  if ( targetSeconds >= (int32_t)lengthSeconds ) targetSeconds = lengthSeconds - 1 ;
+  uint32_t targetByte = ( targetSeconds * (uint64_t)SD_totalbytes ) / lengthSeconds ;
+  uint32_t absolute = SD_audio_start + targetByte ;
+
+  queueToPt ( QSTOPSONG ) ;                              // Flush already buffered old-position audio
+  static uint8_t frameProbe[2048] ;
+  if ( !mp3file.seek ( absolute ) ) return false ;
+  size_t probeLength = mp3file.read ( frameProbe, sizeof(frameProbe) ) ;
+  size_t frameOffset = 0 ;
+  bool frameFound = false ;
+  for ( size_t i = 0 ; i + 3 < probeLength ; i++ )
+  {
+    uint8_t version = ( frameProbe[i + 1] >> 3 ) & 0x03 ;
+    uint8_t layer = ( frameProbe[i + 1] >> 1 ) & 0x03 ;
+    uint8_t bitrateIndex = ( frameProbe[i + 2] >> 4 ) & 0x0F ;
+    uint8_t sampleIndex = ( frameProbe[i + 2] >> 2 ) & 0x03 ;
+    if ( frameProbe[i] == 0xFF && ( frameProbe[i + 1] & 0xE0 ) == 0xE0 &&
+         version != 1 && layer == 1 && bitrateIndex > 0 && bitrateIndex < 15 &&
+         sampleIndex < 3 )
+    {
+      frameOffset = i ;
+      frameFound = true ;
+      break ;
+    }
+  }
+  uint32_t newPosition = absolute + ( frameFound ? frameOffset : 0 ) ;
+  if ( !mp3file.seek ( newPosition ) ) return false ;
+  uint32_t fileSize = mp3file.size() ;
+  mp3filelength = newPosition < fileSize ? fileSize - newPosition : 0 ;
+  displayplaytime ( "" ) ;                                // Force changed digits to redraw immediately
+  queueToPt ( QSTARTSONG ) ;                              // Restart decoder on the aligned MP3 frame
+  ESP_LOGI ( TAG, "MP3 seek %+d s -> %lu s, byte %lu%s",
+             relativeSeconds, (unsigned long)targetSeconds,
+             (unsigned long)newPosition, frameFound ? "" : " (frame not found)" ) ;
+  return true ;
+}
+#endif
+
+
 void sdfuncs()
 {
 #ifdef SDCARD
@@ -4884,6 +5847,15 @@ void sdfuncs()
   static bool         autoplay = true ;                           // Play next after end
   size_t              n ;                                         // Number of bytes read from SD
 
+  if ( openfile && SD_seek_seconds )
+  {
+    int16_t seconds = SD_seek_seconds ;
+    SD_seek_seconds = 0 ;
+    if ( !performSDSeek ( seconds ) )
+    {
+      ESP_LOGI ( TAG, "MP3 seek ignored: duration is unknown" ) ;
+    }
+  }
   if ( openfile )
   {
     while ( ( mp3filelength > 0 ) &&                              // Read until eof or dataqueue full

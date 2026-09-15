@@ -9,7 +9,7 @@
                                                             // also namespace in NVS.
                                                             // Default is "ESP32-Radio"
 
-  //#define SDCARD                                          // Experimental: For SD card support (reading MP3-files)
+  #define SDCARD                                           // SD card support (shared SPI, separate CS)
 
   //#define ETHERNET                                        // For wired Ethernet (WT32-ETH-01 or similar)
 
@@ -20,8 +20,8 @@
   //#define TOGGLEMUTE                                      // "mute" command will toggle mute/unmute
   
   // Define (just one) type of MP3/AAC decoder
-  #define DEC_VS1053                                      // Hardware decoder for MP3, AAC, OGG
-  //#define DEC_VS1003                                      // Hardware decoder for MP3 only
+  //#define DEC_VS1053                                      // Hardware decoder for MP3, AAC, OGG
+  #define DEC_VS1003                                      // Hardware decoder for MP3 only
   //#define DEC_HELIX                                       // Software decoder for MP3, AAC. I2S output
   //#define DEC_HELIX_SPDIF                                 // Toslink/Spdif output for MP3, AAC
   //#define DEC_HELIX_AI                                    // Software decoder for AI Audio kit (AC101)

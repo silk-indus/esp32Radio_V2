@@ -13,6 +13,7 @@
 
 #define TIMEPOS     -44                         // Width reserved for the small smooth clock font
 #define STATIONNUMWIDTH 42                      // Width reserved for the station number
+#define TRACKNUMWIDTH   58                      // Wider field for a larger current/total MP3 number
 #define INIPARS     ini_block.tft_cs_pin, ini_block.tft_dc_pin  // Prameters for dsp_begin
 #define DISPLAYTYPE "BLUETFT"
 
@@ -48,6 +49,7 @@ struct scrseg_struct                                  // For screen segments
 #define displaybattery      bluetft_displaybattery
 #define displayvolume       bluetft_displayvolume
 #define displaytime         bluetft_displaytime
+#define displayplaytime     bluetft_displayplaytime
 
 extern Adafruit_ST7735*     bluetft_tft ;                                 // For instance of display driver
 
@@ -71,10 +73,13 @@ extern scrseg_struct     bluetft_tftdata[TFTSECS] ;                       // Scr
 void bluetft_displaybattery ( uint16_t bat0, uint16_t bat100, uint16_t adcval ) ;
 void bluetft_displayvolume  ( uint8_t vol ) ;
 void bluetft_displaytime    ( const char* str, uint16_t color = 0xFFFF ) ;
+void bluetft_displayplaytime ( const char* str, uint16_t color = 0xFFFF ) ;
 bool bluetft_drawSmoothText ( uint16_t section, const char* str,
                               uint16_t color, uint16_t width ) ;
 void bluetft_drawStationNumber ( const char* str, uint16_t color ) ;
-void bluetft_drawStationList ( const char* const* rows, uint8_t count,
-                               uint8_t selectedRow ) ;
+void bluetft_drawTrackNumber ( const char* str, uint16_t color ) ;
+bool bluetft_drawStationList ( const char* const* rows, uint8_t count,
+                               uint8_t selectedRow, uint16_t scrollOffset,
+                               bool selectedOnly = false ) ;
 bool bluetft_dsp_begin      ( int8_t cs, int8_t dc ) ;
 #endif

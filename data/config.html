@@ -2,7 +2,7 @@
 <html>
  <head>
   <title>Configuration ESP32-radio</title>
-  <meta http-equiv="content-type" content="text/html; charset=ISO-8859-1">
+  <meta charset="UTF-8">
   <link rel="stylesheet" type="text/css" href="style.css">
   <link rel="Shortcut Icon" type="image/ico" href="favicon.ico">
  </head>
@@ -63,7 +63,7 @@
       function fsav()
       {
         var str = prefs.value ;
-        var theUrl = "/saveprefs?version=" + Math.random()  + "&";
+        var theUrl = "/saveprefs?version=" + Math.random() ;
         var xhr = new XMLHttpRequest() ;
         xhr.onreadystatechange = function()
         {
@@ -82,20 +82,25 @@
         {
           str = str.replace ( /\n\n/g, "\n" ) ;
         }
-        // Replace "#" with "($)"", as Asyncwebserver does not like "#"
-        while ( str.indexOf ( "#" ) >= 0 )
+        // Encode every key and value as UTF-8 form data.  The old implementation appended the
+        // raw configuration to the URL and corrupted diacritics, Cyrillic and reserved symbols.
+        var form = [] ;
+        var lines = str.split ( "\n" ) ;
+        for ( var i = 0 ; i < lines.length ; i++ )
         {
-          str = str.replace ( "#", "($)" ) ;
+          var equal = lines[i].indexOf ( "=" ) ;
+          if ( equal < 0 ) continue ;
+          var key = lines[i].slice ( 0, equal ).trim() ;
+          var value = lines[i].slice ( equal + 1 ).trim() ;
+          if ( key.length == 0 || value.length == 0 ) continue ;
+          // Keep the existing server-side comment marker conversion.  A literal # would be
+          // removed by chomp() after URL decoding.
+          value = value.split ( "#" ).join ( "($)" ) ;
+          form.push ( encodeURIComponent ( key ) + "=" + encodeURIComponent ( value ) ) ;
         }
-        // Replace newline with delimeter
-        while ( str.indexOf ( "\n" ) >= 0 )
-        {
-          str = str.replace ( "\n", "&" ) ;
-        }
-        theUrl += str.slice(0,-1) ;				// Chop last ampersand
         xhr.open ( "POST", theUrl, true ) ;
         xhr.setRequestHeader ( "Content-type", "application/x-www-form-urlencoded" ) ;
-        xhr.send() ;
+        xhr.send ( form.join ( "&" ) ) ;
       }
       // Fill configuration initially
       // Get the configuration parameters from preferences

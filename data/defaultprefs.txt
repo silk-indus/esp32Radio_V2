@@ -68,23 +68,25 @@ clk_server = pool.ntp.org                            # Time server to be used
 clk_offset = 1                                       # Offset with respect to UTC in hours
 clk_dst = 1                                          # Offset during daylight saving time (hours)
 #
-# 21-key IR remote: OK opens/confirms station list; number keys enter a preset number
-# In station list: C23D/22DD move one row, 629D/A857 move one page
+# IR remote: every ir_XXXX mapping is editable in Config
+# OK opens/confirms station list; number keys enter a preset number
+# In station list: A857/629D move one row, C23D/22DD move one page
 ir_02FD = ok
-ir_6897 = preset = 0
-ir_30CF = preset = 1
-ir_18E7 = preset = 2
-ir_7A85 = preset = 3
-ir_10EF = preset = 4
-ir_38C7 = preset = 5
-ir_5AA5 = preset = 6
-ir_42BD = preset = 7
-ir_4AB5 = preset = 8
-ir_52AD = preset = 9
+ir_4AB5 = preset = 0
+ir_6897 = preset = 1
+ir_9867 = preset = 2
+ir_B04F = preset = 3
+ir_30CF = preset = 4
+ir_18E7 = preset = 5
+ir_7A85 = preset = 6
+ir_10EF = preset = 7
+ir_38C7 = preset = 8
+ir_5AA5 = preset = 9
 ir_22DD = downpreset = 1
 ir_629D = upvolume = 2
 ir_A857 = downvolume = 2
 ir_C23D = uppreset = 1
+ir_42BD = sdlist                                    # Open SD track list
 #
 # GPIO pinnings
 pin_ir = 35                                          # GPIO Pin number for IR receiver VS1838B
@@ -94,6 +96,10 @@ pin_enc_sw = 13                                      # GPIO Pin number for rotar
 #
 pin_tft_cs = 15                                       # GPIO Pin number for TFT "CS"
 pin_tft_dc = 2                                       # GPIO Pin number for TFT "DC"
+#
+# SD card shares SCK/MISO/MOSI with the display and VS1053
+pin_sd_cs = 21                                        # GPIO Pin number for SD card CS
+#pin_sd_detect = -1                                   # Optional card-detect pin; disabled
 #
 # define pins for decoder.  Example for VS1053
 pin_vs_cs = 5                                        # GPIO Pin number for VS1053 "CS"

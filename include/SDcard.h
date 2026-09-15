@@ -43,6 +43,15 @@ struct mp3spec_t                                      // For List of mp3 file on
   RTC_NOINIT_ATTR char        SD_lastmp3spec[512] ;     // Previous full file spec
   File            mp3file ;                             // File containing mp3 on SD card
   int             mp3filelength = 0 ;                   // Length of file
+  uint32_t        SD_totalbytes = 0 ;                   // Audio bytes at start of current track
+  uint16_t        SD_bitrate = 0 ;                      // Bitrate detected from first MP3 frame
+  uint32_t        SD_duration = 0 ;                     // Exact VBR duration, if present
+  uint32_t        SD_audio_start = 0 ;                  // Absolute offset of the first MP3 frame
+  uint32_t        SD_cover_offset = 0 ;                 // Absolute offset of embedded JPEG cover
+  uint32_t        SD_cover_length = 0 ;                 // Length of embedded JPEG cover
+  int16_t         SD_seek_seconds = 0 ;                 // Pending relative seek request
+  bool            SD_playing = false ;                  // Local track playback is active
+  bool            SD_cover_visible = false ;            // Cover currently occupies the TFT
   bool            randomplay = false ;                  // Switch for random play
   File            trackfile ;                           // File for tracknames
   bool            trackfile_isopen = false ;            // True if trackfile is open for read
@@ -322,6 +331,123 @@ struct mp3spec_t                                      // For List of mp3 file on
   }
 
 
+  // Return MPEG Layer III bitrate in kbps from the first valid frame header.
+  static uint16_t detectSDMP3Bitrate ( const uint8_t* data, size_t len )
+  {
+    static const uint16_t brMpeg1Layer3[16] =
+      { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 } ;
+    static const uint16_t brMpeg2Layer3[16] =
+      { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 } ;
+    for ( size_t i = 0 ; i + 3 < len ; i++ )
+    {
+      if ( data[i] != 0xFF || ( data[i + 1] & 0xE0 ) != 0xE0 ) continue ;
+      uint8_t version = ( data[i + 1] >> 3 ) & 0x03 ;
+      uint8_t layer = ( data[i + 1] >> 1 ) & 0x03 ;
+      uint8_t brIndex = ( data[i + 2] >> 4 ) & 0x0F ;
+      uint8_t sampleIndex = ( data[i + 2] >> 2 ) & 0x03 ;
+      if ( version == 1 || layer != 1 || brIndex == 0 || brIndex == 15 ||
+           sampleIndex == 3 ) continue ;
+      return version == 3 ? brMpeg1Layer3[brIndex] : brMpeg2Layer3[brIndex] ;
+    }
+    return 0 ;
+  }
+
+
+  // Return exact duration from Xing/Info or VBRI, otherwise zero for bitrate-based fallback.
+  static uint32_t detectSDMP3Duration ( const uint8_t* data, size_t len )
+  {
+    static const uint32_t sampleRates[3] = { 44100, 48000, 32000 } ;
+    for ( size_t i = 0 ; i + 40 < len ; i++ )
+    {
+      if ( data[i] != 0xFF || ( data[i + 1] & 0xE0 ) != 0xE0 ) continue ;
+      uint8_t version = ( data[i + 1] >> 3 ) & 0x03 ;
+      uint8_t layer = ( data[i + 1] >> 1 ) & 0x03 ;
+      uint8_t sampleIndex = ( data[i + 2] >> 2 ) & 0x03 ;
+      if ( version == 1 || layer != 1 || sampleIndex == 3 ) continue ;
+      uint32_t sampleRate = sampleRates[sampleIndex] ;
+      if ( version == 2 ) sampleRate /= 2 ;
+      else if ( version == 0 ) sampleRate /= 4 ;
+      bool mono = ( ( data[i + 3] >> 6 ) & 0x03 ) == 3 ;
+      size_t sideInfo = version == 3 ? ( mono ? 17 : 32 ) : ( mono ? 9 : 17 ) ;
+      size_t xing = i + 4 + sideInfo ;
+      if ( xing + 12 <= len &&
+           ( !memcmp ( data + xing, "Xing", 4 ) || !memcmp ( data + xing, "Info", 4 ) ) )
+      {
+        uint32_t flags = ( uint32_t ( data[xing + 4] ) << 24 ) |
+                         ( uint32_t ( data[xing + 5] ) << 16 ) |
+                         ( uint32_t ( data[xing + 6] ) << 8 ) |
+                           uint32_t ( data[xing + 7] ) ;
+        if ( flags & 1 )
+        {
+          uint32_t frames = ( uint32_t ( data[xing + 8] ) << 24 ) |
+                            ( uint32_t ( data[xing + 9] ) << 16 ) |
+                            ( uint32_t ( data[xing + 10] ) << 8 ) |
+                              uint32_t ( data[xing + 11] ) ;
+          uint32_t samplesPerFrame = version == 3 ? 1152 : 576 ;
+          if ( frames && sampleRate )
+          {
+            return ( frames * (uint64_t)samplesPerFrame + sampleRate / 2 ) / sampleRate ;
+          }
+        }
+      }
+      size_t vbri = i + 4 + 32 ;
+      if ( vbri + 18 <= len && !memcmp ( data + vbri, "VBRI", 4 ) )
+      {
+        uint32_t frames = ( uint32_t ( data[vbri + 14] ) << 24 ) |
+                          ( uint32_t ( data[vbri + 15] ) << 16 ) |
+                          ( uint32_t ( data[vbri + 16] ) << 8 ) |
+                            uint32_t ( data[vbri + 17] ) ;
+        uint32_t samplesPerFrame = version == 3 ? 1152 : 576 ;
+        if ( frames && sampleRate )
+        {
+          return ( frames * (uint64_t)samplesPerFrame + sampleRate / 2 ) / sampleRate ;
+        }
+      }
+      return 0 ;                                         // First valid audio frame checked
+    }
+    return 0 ;
+  }
+
+
+  void getSDProgress ( uint32_t& playedSeconds, uint32_t& lengthSeconds,
+                       uint8_t& percent )
+  {
+    playedSeconds = 0 ;
+    lengthSeconds = 0 ;
+    percent = 0 ;
+    if ( !SD_playing || !SD_totalbytes ) return ;
+    uint32_t left = mp3filelength > (int)SD_totalbytes ? SD_totalbytes : mp3filelength ;
+    uint32_t playedBytes = SD_totalbytes - left ;
+    uint64_t percentage = ( playedBytes * 100ULL ) / SD_totalbytes ;
+    percent = percentage > 100 ? 100 : (uint8_t)percentage ;
+    if ( SD_duration )
+    {
+      lengthSeconds = SD_duration ;
+      playedSeconds = ( playedBytes * (uint64_t)SD_duration ) / SD_totalbytes ;
+    }
+    else if ( SD_bitrate )
+    {
+      playedSeconds = ( playedBytes * 8ULL ) / ( (uint32_t)SD_bitrate * 1000ULL ) ;
+      lengthSeconds = ( SD_totalbytes * 8ULL ) / ( (uint32_t)SD_bitrate * 1000ULL ) ;
+    }
+  }
+
+
+  String getSDProgressText()
+  {
+    uint32_t playedSeconds, lengthSeconds ;
+    uint8_t percent ;
+    char text[28] ;
+    getSDProgress ( playedSeconds, lengthSeconds, percent ) ;
+    snprintf ( text, sizeof(text), "%lu:%02lu/%lu:%02lu",
+               (unsigned long)( playedSeconds / 60 ),
+               (unsigned long)( playedSeconds % 60 ),
+               (unsigned long)( lengthSeconds / 60 ),
+               (unsigned long)( lengthSeconds % 60 ) ) ;
+    return String ( text ) ;
+  }
+
+
   //**************************************************************************************************
   //                                  H A N D L E _ I D 3 _ S D                                      *
   //**************************************************************************************************
@@ -338,10 +464,11 @@ struct mp3spec_t                                      // For List of mp3 file on
       uint8_t hflags ;                                        // Headerflags
       uint8_t ttagsize[4] ;                                   // Total tag size
     } ID3head ;
-    uint8_t  exthsiz[4] ;                                     // Extended header size
+    uint8_t  exthsiz[4] = { 0, 0, 0, 0 } ;                    // Extended header size
     uint32_t stx ;                                            // Ext header size converted
     uint32_t sttg ;                                           // Total tagsize converted
     uint32_t stg ;                                            // Size of a single tag
+    uint32_t audioOffset = 0 ;                                // First byte after complete ID3v2 tag
     struct ID3tag_t                                           // Tag in ID3 info
     {
       char    tagid[4] ;                                      // Things like "TCON", "TYER", ...
@@ -350,11 +477,13 @@ struct mp3spec_t                                      // For List of mp3 file on
     } ID3tag ;
     uint8_t   tmpbuf[4] ;                                     // Scratch buffer
     uint8_t   tenc ;                                          // Text encoding
-    String    albttl = String() ;                              // Album and title
-    bool      talb ;                                          // Tag is TALB (album title)
+    String    artist = String() ;                              // Artist shown below the title
     bool      tpe1 ;                                          // Tag is TPE1 (artist)
 
-    tftset ( 2, "Playing from local file" ) ;                 // Assume no ID3
+    SD_cover_offset = 0 ;                                      // No cover until APIC proves otherwise
+    SD_cover_length = 0 ;
+    SD_cover_visible = false ;
+    tftset ( 2, "" ) ;                                        // Assume no artist tag
     p = (char*)path.c_str() + 1 ;                             // Point to filename (after the slash)
     showstreamtitle ( p, true ) ;                             // Show the filename as title (middle part)
     mp3file = SD.open ( path ) ;                              // Open the file
@@ -362,10 +491,14 @@ struct mp3spec_t                                      // For List of mp3 file on
     if ( strncmp ( ID3head.fid, "ID3", 3 ) == 0 )
     {
       sttg = ssconv ( ID3head.ttagsize ) ;                    // Convert tagsize
+      audioOffset = sizeof(ID3head) + sttg ;                  // Skip payload, padding and cover art
+      if ( ID3head.hflags & 0x10 ) audioOffset += 10 ;        // Optional ID3v2 footer
       ESP_LOGI ( STAG, "Found ID3 info" ) ;
       if ( ID3head.hflags & 0x40 )                            // Extended header?
       {
-        stx = ssconv ( exthsiz ) ;                            // Yes, get size of extended header
+        mp3file.read ( exthsiz, sizeof(exthsiz) ) ;           // Read its encoded size first
+        stx = ssconv ( exthsiz ) ;                            // Get size of extended header
+        if ( stx > sttg ) stx = sttg ;                        // Reject corrupt lengths
         while ( stx-- )
         {
           mp3file.read () ;                                   // Skip next byte of extended header
@@ -379,7 +512,12 @@ struct mp3spec_t                                      // For List of mp3 file on
         {
           break ;                                             // Yes, quit the loop
         }
-        stg = ssconv ( ID3tag.tagsize ) ;                     // Convert size of tag
+        stg = ID3head.majV >= 4 ? ssconv ( ID3tag.tagsize ) : // ID3v2.4 uses synchsafe sizes
+              ( (uint32_t)ID3tag.tagsize[0] << 24 ) |
+              ( (uint32_t)ID3tag.tagsize[1] << 16 ) |
+              ( (uint32_t)ID3tag.tagsize[2] << 8 ) |
+                (uint32_t)ID3tag.tagsize[3] ;                 // ID3v2.3 uses big endian
+        if ( stg > sttg ) break ;                             // Corrupt frame length
         if ( ID3tag.tagflags[1] & 0x08 )                      // Compressed?
         {
           sttg -= mp3file.read ( tmpbuf, 4 ) ;                // Yes, ignore 4 bytes
@@ -390,9 +528,58 @@ struct mp3spec_t                                      // For List of mp3 file on
           sttg -= mp3file.read ( tmpbuf, 1 ) ;                // Yes, ignore 1 byte
           stg-- ;                                             // Reduce tagsize by 1
         }
-        if ( stg > ( sizeof(metalinebf) + 2 ) )               // Room for tag?
+        uint32_t payloadStart = mp3file.position() ;
+        if ( strncmp ( ID3tag.tagid, "APIC", 4 ) == 0 && stg > 5 )
         {
-          break ;                                             // No, skip this and further tags
+          // APIC: encoding, MIME\0, picture type, description terminator, JPEG bytes.
+          // Store an offset only; key 0 opens a second SD handle and streams the JPEG to the TFT.
+          uint32_t left = stg ;
+          uint8_t encoding = mp3file.read() ; left-- ;
+          String mime ;
+          while ( left )
+          {
+            int c = mp3file.read() ; left-- ;
+            if ( c <= 0 ) break ;
+            if ( mime.length() < 31 ) mime += (char)c ;
+          }
+          if ( left ) { mp3file.read() ; left-- ; }           // Picture type
+          if ( encoding == 0 || encoding == 3 )               // ISO-8859-1 or UTF-8 description
+          {
+            while ( left && mp3file.read() != 0 ) left-- ;
+            if ( left ) left-- ;
+          }
+          else                                                // UTF-16 description ends in 00 00
+          {
+            int previous = -1 ;
+            while ( left )
+            {
+              int c = mp3file.read() ; left-- ;
+              if ( previous == 0 && c == 0 ) break ;
+              previous = c ;
+            }
+          }
+          mime.toLowerCase() ;
+          uint32_t imageOffset = mp3file.position() ;
+          uint8_t jpegMagic[2] = { 0, 0 } ;
+          bool jpeg = left > 2 && mp3file.read ( jpegMagic, sizeof(jpegMagic) ) == sizeof(jpegMagic) &&
+                      jpegMagic[0] == 0xFF && jpegMagic[1] == 0xD8 ;
+          mp3file.seek ( imageOffset ) ;
+          if ( jpeg )                                          // Trust JPEG SOI even if MIME is nonstandard
+          {
+            SD_cover_offset = imageOffset ;
+            SD_cover_length = left ;
+            ESP_LOGI ( STAG, "Embedded JPEG cover found, %lu bytes, MIME %s",
+                       (unsigned long)SD_cover_length, mime.c_str() ) ;
+          }
+          mp3file.seek ( payloadStart + stg ) ;
+          sttg -= stg ;
+          continue ;
+        }
+        if ( stg > ( sizeof(metalinebf) - 1 ) )                // Room for text tag?
+        {
+          mp3file.seek ( payloadStart + stg ) ;                // Skip large unknown/binary frame
+          sttg -= stg ;
+          continue ;
         }
         sttg -= mp3file.read ( (uint8_t*)metalinebf,
                                stg ) ;                        // Read tag contents
@@ -403,30 +590,28 @@ struct mp3spec_t                                      // For List of mp3 file on
           ESP_LOGI ( STAG, "ID3 %s = %s", ID3tag.tagid,
                     metalinebf + 1 ) ;
         }
-        talb = ( strncmp ( ID3tag.tagid, "TALB", 4 ) == 0 ) ; // Album title
         tpe1 = ( strncmp ( ID3tag.tagid, "TPE1", 4 ) == 0 ) ; // Artist?
-        if ( talb || tpe1 )                                   // Album title or artist?
+        if ( tpe1 )                                           // Artist?
         {
-          albttl += String ( metalinebf + 1 ) ;               // Yes, add to string
-          #ifdef T_NEXTION                                    // NEXTION display?
-            albttl += String ( "\\r" ) ;                      // Add code for newline (2 characters)
-          #else
-            albttl += String ( "\n" ) ;                       // Add newline (1 character)
-          #endif
-          if ( tpe1 )                                         // Artist tag?
-          {
-            icyname = String ( metalinebf + 1 ) ;             // Yes, save for status in webinterface
-          }
+          artist = String ( metalinebf + 1 ) ;                // Artist is the lower field
+          icyname = artist ;                                  // Also use in web interface
         }
         if ( strncmp ( ID3tag.tagid, "TIT2", 4 ) == 0 )       // Songtitle?
         {
-          tftset ( 2, metalinebf + 1 ) ;                      // Yes, show title
+          tftset ( 1, metalinebf + 1 ) ;                      // Song title is the upper field
           icystreamtitle = String ( metalinebf + 1 ) ;        // For status in webinterface
         }
       }
-      tftset ( 1, albttl ) ;                                  // Show album and title
+      tftset ( 2, artist ) ;                                  // Artist is below the song title
+      if ( audioOffset < mp3file.size() )
+      {
+        mp3file.seek ( audioOffset ) ;                        // Probe and play from first audio frame
+      }
     }
-    //mp3file.seek ( 0 ) ;                                      // Back to begin of file
+    else
+    {
+      mp3file.seek ( 0 ) ;                                    // No ID3: restore bytes used for probing
+    }
   }
 
 
@@ -440,7 +625,14 @@ struct mp3spec_t                                      // For List of mp3 file on
     String path ;                                           // Full file spec
 
     stop_mp3client() ;                                      // Disconnect if still connected
-    tftset ( 0, "MP3 Player" ) ;                            // Set screen segment top line
+    SD_playing = false ;                                    // Reset progress until file is ready
+    SD_totalbytes = 0 ;
+    SD_bitrate = 0 ;
+    SD_duration = 0 ;
+    #ifdef BLUETFT
+      displayplaytime ( "" ) ;                           // New track starts a new counter
+    #endif
+    tftset ( 0, "" ) ;                                      // Top-left field will show played/length
     displaytime ( "" ) ;                                    // Clear time on TFT screen
     setdatamode ( DATA ) ;                                  // Start in datamode 
     path = String ( getCurrentSDFileName() ) ;              // Set path to file to play
@@ -453,7 +645,21 @@ struct mp3spec_t                                      // For List of mp3 file on
                  path.c_str() ) ;
       return false ;
     }
-    mp3filelength = mp3file.available() ;                   // Get length
+    size_t audioStart = mp3file.position() ;                // Position after the ID3 tag
+    SD_audio_start = audioStart ;                            // Required for relative seeking
+    static uint8_t probe[1024] ;                            // First MPEG frame and VBR headers
+    size_t probeLength = mp3file.read ( probe, sizeof(probe) ) ;
+    SD_bitrate = detectSDMP3Bitrate ( probe, probeLength ) ;
+    SD_duration = detectSDMP3Duration ( probe, probeLength ) ;
+    mp3file.seek ( audioStart ) ;                           // Probe must not consume audio
+    mp3filelength = mp3file.available() ;                   // Remaining audio bytes
+    SD_totalbytes = mp3filelength ;
+    SD_playing = true ;
+    String progressText = getSDProgressText() ;
+    tftset ( 0, progressText ) ;                            // Replace "MP3 Player"
+    ESP_LOGI ( STAG, "MP3 progress: %s, bitrate %u kbps%s",
+               progressText.c_str(), SD_bitrate,
+               SD_duration ? ", exact VBR length" : "" ) ;
     mqttpub.trigger ( MQTT_STREAMTITLE ) ;                  // Request publishing to MQTT
     chunked = false ;                                       // File not chunked
     metaint = 0 ;                                           // No metadata
@@ -499,6 +705,9 @@ struct mp3spec_t                                      // For List of mp3 file on
   void close_SDCARD()
   {
     ESP_LOGI ( STAG, "Close SD file" ) ;
+    SD_playing = false ;
+    SD_cover_visible = false ;
+    SD_seek_seconds = 0 ;
     mp3file.close() ;                                     // Close the file
   }
 
